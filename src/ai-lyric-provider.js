@@ -93,11 +93,18 @@ const waitForAudioReady = async (audio, timeoutMs = 30000) => {
 
 // 把解析后的歌词行拼成带换行的纯文本（仅原文，按时间顺序）
 const buildOriginalLyricText = (lyrics) => {
-	if (!Array.isArray(lyrics)) return '';
-	return lyrics
-		.map((line) => line?.originalLyric ?? '')
-		.join('\n')
-		.trim();
+	if (!Array.isArray(lyrics)) return { text: '', times: [] };
+	const lines = lyrics.map((line) => line?.originalLyric ?? '');
+	// 去掉首尾空行，保持与后端 raw_lines 一致
+	let start = 0, end = lines.length;
+	while (start < end && !lines[start].trim()) start++;
+	while (end > start && !lines[end - 1].trim()) end--;
+	const trimmed = lines.slice(start, end);
+	return {
+		text: trimmed.join('\n').trim(),
+		// 每行参考时间（秒），对应后端 raw_lines 的每一行
+		times: trimmed.map((_, i) => (lyrics[start + i]?.time ?? 0) / 1000),
+	};
 };
 
 // 探测本地 AI 后端端口
@@ -125,12 +132,15 @@ const findActiveBackendPort = async (startPort = AI_BACKEND_START_PORT, maxTries
 };
 
 // 把音频 blob + 歌词文本发送到后端，返回 { standardLrc, enhancedLrc }
-const requestAILyric = async (audioBlob, originalLyricText, songInfo) => {
+const requestAILyric = async (audioBlob, originalLyricText, songInfo, times) => {
 	const activePort = await findActiveBackendPort();
 
 	const formData = new FormData();
 	formData.append('audio', audioBlob, 'audio.bin');
 	formData.append('lyrics', originalLyricText);
+	if (Array.isArray(times) && times.length > 0) {
+		formData.append('times', JSON.stringify(times));
+	}
 	formData.append('ti', songInfo?.name ?? '');
 	formData.append('ar', songInfo?.artist ?? '');
 	formData.append('al', songInfo?.album ?? '');
@@ -365,7 +375,7 @@ export async function applyAILyric(lyrics) {
 	}
 
 	// 1. 没有歌词文本就不处理
-	const originalLyricText = buildOriginalLyricText(lyrics);
+	const { text: originalLyricText, times } = buildOriginalLyricText(lyrics);
 	if (!originalLyricText) {
 		console.log('[AI Lyric] 歌曲没有歌词文本，跳过 AI 处理');
 		return null;
@@ -414,7 +424,7 @@ export async function applyAILyric(lyrics) {
 	let requestOk = false;
 	for (let attempt = 0; attempt < 2 && !requestOk; attempt++) {
 		try {
-			result = await requestAILyric(audioBlob, originalLyricText, getSongInfo());
+			result = await requestAILyric(audioBlob, originalLyricText, getSongInfo(), times);
 			requestOk = true;
 		} catch (e) {
 			console.warn(`[AI Lyric] 请求后端失败 (第 ${attempt + 1} 次)`, e);
