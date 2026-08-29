@@ -55,7 +55,30 @@ BetterNCM 的插件目录（以 Windows 默认安装为例）：
 
 > ⚠️ BetterNCM 每次启动都会从 `.plugin` 重新解压到 `plugins_runtime`，所以**只更新运行时目录不够**，必须同时重新打包 `.plugin` 文件。
 
-### 一键部署（PowerShell）
+### 一键部署脚本（推荐）
+
+项目根目录提供了 `deploy.ps1` 脚本，自动完成打包 + 更新运行时：
+
+```powershell
+# 构建并部署
+.\deploy.ps1 -Build
+
+# 仅部署现有 dist/ 产物（跳过构建）
+.\deploy.ps1
+```
+
+脚本会自动从 `dist/manifest.json` 读取版本号，无需手动改文件名。如果 BetterNCM 不在默认路径，可指定根目录：
+
+```powershell
+.\deploy.ps1 -Build -BetterNCMRoot "D:\betterncm"
+```
+
+> 如果提示"禁止运行脚本"，先执行一次：
+> ```powershell
+> Set-ExecutionPolicy -Scope Process Bypass
+> ```
+
+### 手动部署（PowerShell）
 
 构建完成后，在项目根目录运行以下命令（把版本号换成 `manifest.json` 里的 `version`）：
 
