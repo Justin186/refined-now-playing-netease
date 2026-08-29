@@ -3,6 +3,7 @@
 
 import { parseLyric } from './liblyric/index.ts'
 import { cyrb53 } from './utils.js'
+import { applyAILyric } from './ai-lyric-provider.js'
 
 const preProcessLyrics = (lyrics) => {
 	if (!lyrics) return null;
@@ -87,7 +88,15 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 		currentRawLRC = (rawLyrics?.lrc?.lyric ?? '') ;
 		const preprocessedLyrics = preProcessLyrics(rawLyrics);
 		setTimeout(async () => {
-			const processedLyrics = await processLyrics(preprocessedLyrics);
+			let processedLyrics = await processLyrics(preprocessedLyrics);
+
+			// AI 逐字歌词处理：从 LibFrontendPlay 获取音频，连同歌词文本发送到本地后端，
+			// 用返回的逐字歌词替换 dynamicLyric。失败时保留原歌词。
+			const aiLyrics = await applyAILyric(processedLyrics);
+			if (aiLyrics) {
+				processedLyrics = aiLyrics;
+			}
+
 			const lyrics = {
 				lyrics: processedLyrics,
 				contributors: {}
