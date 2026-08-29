@@ -499,7 +499,12 @@ const addSettingsMenu = async (isFM = false) => {
 		const lyricAnimationTiming = getOptionDom('#lyric-animation-timing');
 		const lyricGlow = getOptionDom('#lyric-glow');
 		const lyricContributorsDisplay = getOptionDom('#lyric-contributors-display');
+		const aiLyric = getOptionDom('#ai-lyric');
 		
+
+		bindCheckboxToFunction(aiLyric, (x) => {
+			window.aiLyricEnabled = x;
+		}, false);
 
 		bindCheckboxToClass(originalLyricBold, 'original-lyric-bold', true);
 

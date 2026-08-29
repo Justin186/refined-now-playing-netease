@@ -8,6 +8,8 @@
 //                         返回 { code: 200, data: { standard_lrc, enhanced_lrc } }
 //   enhanced_lrc 为 ESLRC 逐字格式：行首 [mm:ss.xx] 为行起始，每个词后跟 [mm:ss.xx] 为词结束时间
 
+import { getSetting } from './utils.js';
+
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
 
@@ -357,6 +359,11 @@ const getSongInfo = () => {
 // 把后端返回的逐字歌词应用到现有歌词行上
 // 返回新的歌词数组（替换了 dynamicLyric），失败时返回 null
 export async function applyAILyric(lyrics) {
+	// 0. 设置中未启用 AI 逐字歌词时直接跳过（不探测端口、不下载音频）
+	if (!getSetting('ai-lyric', false)) {
+		return null;
+	}
+
 	// 1. 没有歌词文本就不处理
 	const originalLyricText = buildOriginalLyricText(lyrics);
 	if (!originalLyricText) {
