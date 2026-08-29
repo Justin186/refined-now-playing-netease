@@ -213,13 +213,35 @@ const parseEnhancedLrc = (lrc) => {
 	return lines;
 };
 
-// 后处理：标记 CJK 字符、空格结尾、尾部拖长音（与 liblyric 的 processLyric 逻辑一致）
+// 判断两个相邻英文词之间是否需要插入空格（后端 ESLRC 不包含词间空格）
+const shouldInsertSpace = (prev, next) => {
+	if (!prev || !next) return false;
+	// 中日韩文字之间不加空格
+	const CJKRegex = /([\p{Unified_Ideograph}|\u3040-\u309F|\u30A0-\u30FF])/gu;
+	if (prev.match(CJKRegex) || next.match(CJKRegex)) return false;
+	// 前一个词以字母/数字/闭合标点结尾，后一个词以字母/数字/开放标点开头 → 加空格
+	// 注意：后一个词以撇号开头（如 're/'m/'s）表示缩写连读，不加空格
+	const prevEndsWord = /[A-Za-z0-9'",.!?;:%>)\]}]$/.test(prev);
+	const nextStartsWord = /^[A-Za-z0-9("\[{<`$#]/.test(next);
+	return prevEndsWord && nextStartsWord;
+};
+
+// 后处理：标记 CJK 字符、空格结尾、英文词间自动补空格（与 liblyric 的 processLyric 逻辑一致）
 const postProcessDynamicLyric = (lines) => {
 	const CJKRegex = /([\p{Unified_Ideograph}|\u3040-\u309F|\u30A0-\u30FF])/gu;
 	for (const line of lines) {
 		const dynamic = line.words || [];
-		for (const word of dynamic) {
+		for (let i = 0; i < dynamic.length; i++) {
+			const word = dynamic[i];
 			if (word?.word?.match(CJKRegex)) word.isCJK = true;
+			// 英文单词之间自动补空格：直接把空格写入词文本（供其他插件使用），
+			// 同时保留 endsWithSpace 标记（本插件渲染用）
+			if (i < dynamic.length - 1) {
+				const next = dynamic[i + 1];
+				if (shouldInsertSpace(word.word, next.word)) {
+					word.word += ' ';
+				}
+			}
 			if (word?.word?.match(/\s$/)) word.endsWithSpace = true;
 		}
 	}
@@ -252,6 +274,29 @@ const parseStandardLrc = (lrc) => {
 	return lines.sort((a, b) => a.time - b.time);
 };
 
+// 计算两段文本的相似度（0~1），用于判断标准行是否与原始行匹配
+const calcSimilarity = (a, b) => {
+	if (!a || !b) return 0;
+	a = a.trim();
+	b = b.trim();
+	if (a === b) return 1;
+	if (a.length === 0 || b.length === 0) return 0;
+	// 字符集合交集比例
+	const setA = new Set(a);
+	const setB = new Set(b);
+	let common = 0;
+	for (const ch of setA) {
+		if (setB.has(ch)) common++;
+	}
+	return common / Math.max(setA.size, setB.size);
+};
+
+// 判断是否为元数据行（作詞/作曲/編曲等 Staff 信息），这些行不应被标准 LRC 覆盖文本或附加逐字
+const isMetadataLine = (text) => {
+	if (!text) return false;
+	return /^(作詞|作曲|編曲|作词|作曲|编曲|作詞者|作曲者|編曲者|作词者|作曲者|编曲者|歌詞|歌词|訳詞|译词|翻譯|翻译|原唱|演唱|製作|制作|監製|监制|企劃|企划|出品|发行|發行|原曲|和声|和聲|伴唱|混音|母带|母帶|录音|錄音|制作人|製作人)[:：]/.test(text);
+};
+
 // 把逐字歌词行对齐到标准 LRC 行，重建歌词数组
 // 以原歌词为基础（保留所有行，包括元数据/间奏），用标准 LRC 修正文本和时间，
 // 用增强 LRC 提供逐字数据（dynamicLyric）
@@ -279,13 +324,13 @@ const mergeLyrics = (standardLines, enhancedLines, originalLyrics) => {
 		}
 		// 保留原歌词所有字段（翻译/罗马音/间奏等）
 		const base = { ...origLine };
-		// 用标准行修正文本和时间（时间接近才覆盖，避免错位）
-		if (stdLine && stdDiff < 3000) {
+		// 用标准行修正文本和时间（时间接近、文本相似且非元数据行才覆盖，避免错位/元数据被错误替换）
+		if (stdLine && stdDiff < 3000 && !isMetadataLine(origLine.originalLyric) && calcSimilarity(stdLine.lyric, origLine.originalLyric) >= 0.5) {
 			base.originalLyric = stdLine.lyric;
 			base.time = stdLine.time;
 		}
 		// 只有匹配到时间接近的逐字行（说明是真正的歌词行）才附加逐字数据
-		if (best && best.words && best.words.length > 0 && bestDiff < 3000) {
+		if (best && best.words && best.words.length > 0 && bestDiff < 3000 && !isMetadataLine(origLine.originalLyric)) {
 			base.duration = (best.end ?? best.time ?? base.time) - (best.time ?? base.time);
 			base.dynamicLyric = best.words;
 			base.dynamicLyricTime = best.time ?? base.time;
@@ -385,6 +430,10 @@ export async function applyAILyric(lyrics) {
 	}
 	enhancedLines.forEach((l) => postProcessDynamicLyric([l]));
 
+	// 调试：输出后端返回的原始 LRC，便于排查元数据行/英文空格问题
+	console.log('[AI Lyric] standard_lrc:', result.standardLrc);
+	console.log('[AI Lyric] enhanced_lrc:', result.enhancedLrc);
+
 	// 7. 用标准 LRC 重建歌词行结构，逐字数据对齐到标准行
 	//    优先使用标准 LRC 行（解决"一行显示多次"的行数不匹配问题），
 	//    并保留原歌词的翻译/罗马音字段
@@ -403,10 +452,10 @@ export async function applyAILyric(lyrics) {
 					best = enhLine;
 				}
 			}
-			if (best && best.words && best.words.length > 0) {
+			if (best && best.words && best.words.length > 0 && !isMetadataLine(line.originalLyric)) {
 				return {
 					...line,
-					originalLyric: best.words.map((w) => w.word).join(''),
+					originalLyric: best.words.map((w) => w.word).join('').trim(),
 					dynamicLyric: best.words,
 					dynamicLyricTime: best.time ?? line.time,
 					duration: (best.end ?? best.time ?? line.time) - (best.time ?? line.time),
