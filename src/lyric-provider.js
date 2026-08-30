@@ -41,6 +41,20 @@ const processLyrics = (lyrics) => {
 			line.isMetadata = true; // 元数据行（作词/作曲/编曲等）：时间线里快速跳过
 		}
 	}
+	// 开头的连续元数据行（作词/作曲/编曲等）重写时间戳为每行 1 秒递增，
+	// 使其他插件（如 lyricbar）读取 window.currentLyrics 时与 CD 页的快速跳过显示一致。
+	// 第一行保持原始时间作为基准，后续元数据行依次 +1000ms。
+	const metadataDisplayDuration = 1000;
+	let leadingMetaCount = 0;
+	while (leadingMetaCount < lyrics.length && lyrics[leadingMetaCount]?.isMetadata) {
+		leadingMetaCount++;
+	}
+	if (leadingMetaCount > 0) {
+		const firstMetaTime = lyrics[0].time ?? 0;
+		for (let i = 0; i < leadingMetaCount; i++) {
+			lyrics[i].time = firstMetaTime + i * metadataDisplayDuration;
+		}
+	}
 	/*for (const line of lyrics) {
 		if (!line.dynamicLyric) {
 			// 拆开每一个 CJK 字符，但是保留英文单词不拆

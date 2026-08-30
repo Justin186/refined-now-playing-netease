@@ -346,7 +346,11 @@ const mergeLyrics = (standardLines, enhancedLines, originalLyrics, startOffset =
 
 		// 标准行修正文本和时间（所有行都显示标准行文本，包括元数据行/间奏空行）
 		base.originalLyric = stdLine.lyric;
-		base.time = stdLine.time;
+		// 元数据行保留 processLyrics 已重写好的 1 秒递增时间戳（供其他插件与 CD 页一致），
+		// 不覆盖为标准 LRC 的原始时间；非元数据行才用标准行时间
+		if (!isMeta) {
+			base.time = stdLine.time;
+		}
 
 		// 元数据行不附加逐字，并清除原始歌词行（官方 YRC）自带的 dynamicLyric
 		if (isMeta) {
