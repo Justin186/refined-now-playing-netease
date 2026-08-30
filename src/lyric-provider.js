@@ -53,6 +53,9 @@ const processLyrics = (lyrics) => {
 		const firstMetaTime = lyrics[0].time ?? 0;
 		for (let i = 0; i < leadingMetaCount; i++) {
 			lyrics[i].time = firstMetaTime + i * metadataDisplayDuration;
+			// 设置 1 秒 duration，使其他插件（如 lyricbar）能正确显示每行 1 秒的时长，
+			// 而不是持续到歌曲结尾
+			lyrics[i].duration = metadataDisplayDuration;
 		}
 	}
 	/*for (const line of lyrics) {

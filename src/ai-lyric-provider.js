@@ -352,11 +352,13 @@ const mergeLyrics = (standardLines, enhancedLines, originalLyrics, startOffset =
 			base.time = stdLine.time;
 		}
 
-		// 元数据行不附加逐字，并清除原始歌词行（官方 YRC）自带的 dynamicLyric
+		// 元数据行不附加逐字，并清除原始歌词行（官方 YRC）自带的 dynamicLyric；
+		// 设置 1 秒 duration，使其他插件（如 lyricbar）能正确显示每行 1 秒的时长
+		// （与 CD 页 metadataDisplayDuration 一致），而不是持续到歌曲结尾
 		if (isMeta) {
 			delete base.dynamicLyric;
 			delete base.dynamicLyricTime;
-			delete base.duration;
+			base.duration = 1000;
 		}
 
 		// 附加逐字数据（元数据行不需要逐字）
@@ -528,7 +530,10 @@ export async function applyAILyric(lyrics) {
 			if (idx < 0 || idx >= enhancedLines.length) return line;
 			const enhLine = enhancedLines[idx];
 			if (!enhLine || !enhLine.words || enhLine.words.length === 0) return line;
-			if (isMetadataLine(line.originalLyric)) return line;
+			if (isMetadataLine(line.originalLyric)) {
+				// 元数据行：设置 1 秒 duration，供其他插件正确显示时长
+				return { ...line, duration: 1000 };
+			}
 			return {
 				...line,
 				originalLyric: enhLine.words.map((w) => w.word).join('').trim(),
