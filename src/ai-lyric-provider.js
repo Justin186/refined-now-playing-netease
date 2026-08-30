@@ -241,16 +241,20 @@ const parseEnhancedLrc = (lrc) => {
 	return lines;
 };
 
-// 判断两个相邻英文词之间是否需要插入空格（后端 ESLRC 不包含词间空格）
+// 判断两个相邻拉丁词之间是否需要插入空格（后端 ESLRC 不包含词间空格）
+// 注意：不仅支持纯 ASCII 英文，还支持带变音符号的拉丁字符（如越南语、法语、德语等），
+// 否则越南语等小语种单词会因变音符号（如 ạ/ẹ/ị/ọ/ụ/ỳ，位于 \u1E00-\u1EFF）不匹配而粘连。
 const shouldInsertSpace = (prev, next) => {
 	if (!prev || !next) return false;
 	// 中日韩文字之间不加空格
 	const CJKRegex = /([\p{Unified_Ideograph}|\u3040-\u309F|\u30A0-\u30FF])/gu;
 	if (prev.match(CJKRegex) || next.match(CJKRegex)) return false;
+	// 拉丁字母（含变音符号）：ASCII + Latin-1 补充 + 拉丁扩展 A/B + 拉丁扩展附加（越南语）
+	const latinLetter = 'A-Za-z\\u00C0-\\u024F\\u1E00-\\u1EFF';
 	// 前一个词以字母/数字/闭合标点结尾，后一个词以字母/数字/开放标点开头 → 加空格
 	// 注意：后一个词以撇号开头（如 're/'m/'s）表示缩写连读，不加空格
-	const prevEndsWord = /[A-Za-z0-9'",.!?;:%>)\]}]$/.test(prev);
-	const nextStartsWord = /^[A-Za-z0-9("\[{<`$#]/.test(next);
+	const prevEndsWord = new RegExp('[' + latinLetter + '0-9\'",.!?;:%>)\\]}]$').test(prev);
+	const nextStartsWord = new RegExp('^[' + latinLetter + '0-9("\\[{<`$#]').test(next);
 	return prevEndsWord && nextStartsWord;
 };
 
