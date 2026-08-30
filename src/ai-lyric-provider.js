@@ -273,31 +273,84 @@ const isMetadataLine = (text) => {
 	return /^(作詞|作曲|編曲|作词|作曲|编曲|作詞者|作曲者|編曲者|作词者|作曲者|编曲者|歌詞|歌词|訳詞|译词|翻譯|翻译|原唱|演唱|製作|制作|監製|监制|企劃|企划|出品|发行|發行|原曲|和声|和聲|伴唱|混音|母带|母帶|录音|錄音|制作人|製作人)[:：]/.test(text);
 };
 
+// 拼接增强行的完整文本（用于文本相似度决胜）
+const enhLineText = (line) => (line?.words ?? []).map((w) => w.word).join('').trim();
+
 // 把逐字歌词行对齐到标准 LRC 行，重建歌词数组
 // 以原歌词为基础（保留所有行，包括元数据/间奏），用标准 LRC 修正文本和时间，
 // 用增强 LRC 提供逐字数据（dynamicLyric）
+//
+// 关键：用双指针（enhIdx/stdIdx）按时间顺序把增强行/标准行依次分配给原始行，
+// 保证一一对应。否则若后端返回多行相同时间戳的逐字行（如 [02:10.18] 连续多行），
+// 按"最近时间"独立匹配会把多行全部匹配到第一行，导致逐字错乱/串行。
+// 时间相同时用文本相似度决胜，避免同时间戳行被错误消费。
 const mergeLyrics = (standardLines, enhancedLines, originalLyrics) => {
+	// 按时间排序，保证双指针按时间顺序一一对应
+	const sortedEnhanced = [...enhancedLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+	const sortedStandard = [...standardLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+
+	let enhIdx = 0;
+	let stdIdx = 0;
+
 	return originalLyrics.map((origLine) => {
-		// 找时间最接近的标准行（修正文本和时间）
+		const origTime = origLine.time ?? 0;
+		const origText = (origLine.originalLyric ?? '').trim();
+		const isInterlude = origLine.isInterlude || !origText;
+
+		// 标准行：双指针推进，找到时间最接近且不回头；时间相同时用文本相似度决胜
 		let stdLine = null;
 		let stdDiff = Infinity;
-		for (const sl of standardLines) {
-			const diff = Math.abs((sl.time ?? 0) - (origLine.time ?? 0));
+		while (stdIdx < sortedStandard.length) {
+			const cur = sortedStandard[stdIdx];
+			const diff = Math.abs((cur.time ?? 0) - origTime);
 			if (diff < stdDiff) {
 				stdDiff = diff;
-				stdLine = sl;
+				stdLine = cur;
+				stdIdx++;
+			} else if (diff === stdDiff && stdLine) {
+				// 时间相同，用文本相似度决胜
+				const curSim = calcSimilarity(cur.lyric, origText);
+				const stdSim = calcSimilarity(stdLine.lyric, origText);
+				if (curSim > stdSim) {
+					stdLine = cur;
+				}
+				stdIdx++;
+			} else {
+				break;
 			}
 		}
-		// 找时间最接近的增强行（逐字数据）
+
+		// 增强行：双指针推进（仅对真正的歌词行消费增强行，间奏/空行不消费）
+		// 时间相同时用文本相似度决胜，避免多行同时间戳时全部串到第一行
 		let best = null;
 		let bestDiff = Infinity;
-		for (const enhLine of enhancedLines) {
-			const diff = Math.abs((enhLine.time ?? 0) - (origLine.time ?? 0));
-			if (diff < bestDiff) {
-				bestDiff = diff;
-				best = enhLine;
+		if (!isInterlude) {
+			while (enhIdx < sortedEnhanced.length - 1) {
+				const cur = sortedEnhanced[enhIdx];
+				const next = sortedEnhanced[enhIdx + 1];
+				const curDiff = Math.abs((cur.time ?? 0) - origTime);
+				const nextDiff = Math.abs((next.time ?? 0) - origTime);
+				if (nextDiff < curDiff) {
+					enhIdx++;
+				} else if (nextDiff === curDiff) {
+					// 时间相同，用文本相似度决胜
+					const curSim = calcSimilarity(enhLineText(cur), origText);
+					const nextSim = calcSimilarity(enhLineText(next), origText);
+					if (nextSim > curSim) {
+						enhIdx++;
+					} else {
+						break;
+					}
+				} else {
+					break;
+				}
+			}
+			if (enhIdx < sortedEnhanced.length) {
+				best = sortedEnhanced[enhIdx];
+				bestDiff = Math.abs((best.time ?? 0) - origTime);
 			}
 		}
+
 		// 保留原歌词所有字段（翻译/罗马音/间奏等）
 		const base = { ...origLine };
 		// 用标准行修正文本和时间（时间接近、文本相似且非元数据行才覆盖，避免错位/元数据被错误替换）
@@ -436,17 +489,41 @@ export async function applyAILyric(lyrics) {
 		newLyrics = mergeLyrics(standardLines, enhancedLines, lyrics);
 	} else {
 		// 后端未返回标准 LRC 时，退回按时间匹配原歌词行
+		// 同样用双指针保证一一对应，避免多行同时间戳时全部串到第一行
+		const sortedEnhanced = [...enhancedLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+		let enhIdx = 0;
 		newLyrics = lyrics.map((line) => {
+			const origTime = line.time ?? 0;
+			const origText = (line.originalLyric ?? '').trim();
+			const isInterlude = line.isInterlude || !origText;
 			let best = null;
 			let bestDiff = Infinity;
-			for (const enhLine of enhancedLines) {
-				const diff = Math.abs((enhLine.time ?? 0) - (line.time ?? 0));
-				if (diff < bestDiff) {
-					bestDiff = diff;
-					best = enhLine;
+			if (!isInterlude) {
+				while (enhIdx < sortedEnhanced.length - 1) {
+					const cur = sortedEnhanced[enhIdx];
+					const next = sortedEnhanced[enhIdx + 1];
+					const curDiff = Math.abs((cur.time ?? 0) - origTime);
+					const nextDiff = Math.abs((next.time ?? 0) - origTime);
+					if (nextDiff < curDiff) {
+						enhIdx++;
+					} else if (nextDiff === curDiff) {
+						const curSim = calcSimilarity(enhLineText(cur), origText);
+						const nextSim = calcSimilarity(enhLineText(next), origText);
+						if (nextSim > curSim) {
+							enhIdx++;
+						} else {
+							break;
+						}
+					} else {
+						break;
+					}
+				}
+				if (enhIdx < sortedEnhanced.length) {
+					best = sortedEnhanced[enhIdx];
+					bestDiff = Math.abs((best.time ?? 0) - origTime);
 				}
 			}
-			if (best && best.words && best.words.length > 0 && !isMetadataLine(line.originalLyric)) {
+			if (best && best.words && best.words.length > 0 && bestDiff < 3000 && !isMetadataLine(line.originalLyric)) {
 				return {
 					...line,
 					originalLyric: best.words.map((w) => w.word).join('').trim(),
