@@ -85,6 +85,35 @@ const processLyrics = (lyrics) => {
 	return lyrics;
 }
 
+// 在开头的连续元数据行（作词/作曲/编曲等）之后插入一个间奏行，
+// 使 CD 页的 Interlude 组件（三个点 KTV 倒计时）能显示出来。
+// 仅当元数据行后面不是间奏空行（即直接是歌词）时插入；
+// 若元数据行后面已有间奏空行，则无需插入（CD 页已能显示三个点）。
+const insertInterludeAfterMetadata = (lyrics) => {
+	if (!lyrics || lyrics.length === 0) return lyrics;
+	let leadingMetaCount = 0;
+	while (leadingMetaCount < lyrics.length && lyrics[leadingMetaCount]?.isMetadata) {
+		leadingMetaCount++;
+	}
+	if (leadingMetaCount === 0) return lyrics;
+	// 元数据行后面已经是间奏空行，无需插入
+	const nextLine = lyrics[leadingMetaCount];
+	if (!nextLine || (nextLine.originalLyric ?? '').trim().length === 0) return lyrics;
+	// 间奏区间：最后一个元数据行结束 → 下一句歌词开始
+	const lastMeta = lyrics[leadingMetaCount - 1];
+	const start = (lastMeta?.time ?? 0) + (lastMeta?.duration ?? 1000);
+	const end = nextLine.time ?? start;
+	if (end <= start) return lyrics; // 无实际间奏时长，不插入
+	const interlude = {
+		time: start,
+		duration: end - start,
+		originalLyric: '',
+		isInterlude: true,
+	};
+	lyrics.splice(leadingMetaCount, 0, interlude);
+	return lyrics;
+};
+
 let currentRawLRC = null;
 
 const _onProcessLyrics = window.onProcessLyrics ?? ((x) => x);
@@ -117,6 +146,9 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 			if (aiLyrics) {
 				processedLyrics = aiLyrics;
 			}
+
+			// 在元数据行后插入间奏行，使 CD 页能显示三个点（KTV 倒计时）间奏动画
+			processedLyrics = insertInterludeAfterMetadata(processedLyrics);
 
 			const lyrics = {
 				lyrics: processedLyrics,

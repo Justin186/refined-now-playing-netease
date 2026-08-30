@@ -60,6 +60,12 @@ export function ProgressbarPreview(props) {
 	const [currentLine, setCurrentLine] = useState(0);
 	const [currentNonInterludeIndex, setCurrentNonInterludeIndex] = useState(0);
 	const [currentTime, setCurrentTime] = useState(0);
+	// 元数据行（作词/作曲/编曲等）过完后、下一句歌词开始前的间奏状态：
+	// 为 true 时预览显示 ♪，而不是直接跳到下一句歌词
+	const [showInterludeAfterMeta, setShowInterludeAfterMeta] = useState(false);
+	// 间奏 ♪ 的时间区间（毫秒）：从最后一个元数据行结束到下一句歌词开始
+	const [interludeStart, setInterludeStart] = useState(0);
+	const [interludeEnd, setInterludeEnd] = useState(0);
 
 	const [_totalLength, totalLength, setTotalLength] = useRefState(totalLengthInit);
 
@@ -132,14 +138,59 @@ export function ProgressbarPreview(props) {
 			) {
 				cur = _lyrics.current.length;
 			}
+			// 元数据行（作词/作曲/编曲等）快速跳过：悬停时间超过开头的连续元数据行后，
+			// 跳到第一个非元数据行（可能是间奏 ♪ 或正常歌词），而不是停留在最后一个元数据行
+			let leadingMetaCount = 0;
+			while (leadingMetaCount < _lyrics.current.length && _lyrics.current[leadingMetaCount]?.isMetadata) {
+				leadingMetaCount++;
+			}
+			// 局部间奏状态（避免 setState 异步导致本次计算读到旧值）
+			let isInterludeState = false;
+			let interludeStartLocal = 0;
+			let interludeEndLocal = 0;
+			if (leadingMetaCount > 0) {
+				const firstMetaTime = _lyrics.current[0].time ?? 0;
+				const elapsed = currentTime - firstMetaTime;
+				if (elapsed < leadingMetaCount * 1000) {
+					cur = Math.min(Math.floor(elapsed / 1000), leadingMetaCount - 1);
+				} else {
+					// 元数据行过完后：若下一个非元数据行不是间奏空行，则在下一句歌词开始前
+					// 显示 ♪ 间奏；若本身就是间奏空行，循环已正确跳到该行或后续行，无需特殊处理
+					const nextLine = _lyrics.current[leadingMetaCount];
+					const isNextInterlude = nextLine && (nextLine.originalLyric ?? '').trim().length === 0;
+					if (!isNextInterlude) {
+						const nextTime = nextLine?.time ?? Infinity;
+						if (currentTime < nextTime) {
+							// 间奏 ♪ 的时间区间：最后一个元数据行结束 → 下一句歌词开始
+							const lastMeta = _lyrics.current[leadingMetaCount - 1];
+							interludeStartLocal = (lastMeta?.time ?? 0) + (lastMeta?.duration ?? 1000);
+							interludeEndLocal = nextTime;
+							isInterludeState = true;
+						} else {
+							cur = Math.max(cur, leadingMetaCount);
+						}
+					}
+				}
+			}
+			setShowInterludeAfterMeta(isInterludeState);
+			if (isInterludeState) {
+				setInterludeStart(interludeStartLocal);
+				setInterludeEnd(interludeEndLocal);
+			}
 			setCurrentLine(cur);
 			setCurrentNonInterludeIndex(Math.max(nonInterludeIndex, 1));
 			if (subprogressbarInnerRef.current) {
-				let duration =  _lyrics.current[cur]?.duration;
-				if (duration == 0) {
-					duration = _totalLength.current - _lyrics.current[cur].time;
+				// 间奏 ♪ 状态下用间奏区间计算进度，否则用当前行区间
+				let start = _lyrics.current[cur]?.time;
+				let duration = _lyrics.current[cur]?.duration;
+				if (isInterludeState) {
+					start = interludeStartLocal;
+					duration = interludeEndLocal - interludeStartLocal;
 				}
-				subprogressbarInnerRef.current.style.width = (currentTime - _lyrics.current[cur].time) / duration * 100 + '%';
+				if (duration == 0) {
+					duration = _totalLength.current - start;
+				}
+				subprogressbarInnerRef.current.style.width = (currentTime - start) / duration * 100 + '%';
 			}
 		}
 	};
@@ -209,12 +260,12 @@ export function ProgressbarPreview(props) {
 			className={`progressbar-preview ${(visible && !isPureMusic) ? '' : 'invisible'}`}
 		>
 			{
-				lyrics && lyrics[currentLine]?.originalLyric && (
+				lyrics && !showInterludeAfterMeta && lyrics[currentLine]?.originalLyric && (
 					<div className="progressbar-preview-number">{currentNonInterludeIndex} / {nonInterludeCount}</div>
 				)
 			}
 			{
-				lyrics && lyrics[currentLine]?.dynamicLyric && (
+				lyrics && !showInterludeAfterMeta && lyrics[currentLine]?.dynamicLyric && (
 					<div className="progressbar-preview-line-karaoke">
 						{
 							lyrics[currentLine].dynamicLyric.map((word, i) => {
@@ -234,17 +285,17 @@ export function ProgressbarPreview(props) {
 				)
 			}
 			{
-				lyrics && !lyrics[currentLine]?.dynamicLyric && lyrics[currentLine]?.originalLyric && (
+				lyrics && !showInterludeAfterMeta && !lyrics[currentLine]?.dynamicLyric && lyrics[currentLine]?.originalLyric && (
 					<div className="progressbar-preview-line-original">{lyrics[currentLine]?.originalLyric}</div>
 				)
 			}
 			{
-				lyrics && lyrics[currentLine]?.originalLyric == '' && (
+				lyrics && (showInterludeAfterMeta || lyrics[currentLine]?.originalLyric == '') && (
 					<div className="progressbar-preview-line-original">♪</div>
 				)
 			}
 			{
-				lyrics && lyrics[currentLine]?.translatedLyric && (
+				lyrics && !showInterludeAfterMeta && lyrics[currentLine]?.translatedLyric && (
 					<div className="progressbar-preview-line-translated">{lyrics[currentLine]?.translatedLyric}</div>
 				)
 			}
@@ -258,8 +309,17 @@ export function ProgressbarPreview(props) {
 			{
 				lyrics && lyrics[currentLine] && (
 					<div className="progressbar-preview-line-time">
-						<div>{formatTime(lyrics[currentLine]?.time / 1000)}</div>
-						<div>{lyrics[currentLine]?.duration > 0 ? formatTime((lyrics[currentLine]?.time + lyrics[currentLine]?.duration) / 1000) : formatTime(totalLength / 1000)}</div>
+						{showInterludeAfterMeta ? (
+							<>
+								<div>{formatTime(interludeStart / 1000)}</div>
+								<div>{formatTime(interludeEnd / 1000)}</div>
+							</>
+						) : (
+							<>
+								<div>{formatTime(lyrics[currentLine]?.time / 1000)}</div>
+								<div>{lyrics[currentLine]?.duration > 0 ? formatTime((lyrics[currentLine]?.time + lyrics[currentLine]?.duration) / 1000) : formatTime(totalLength / 1000)}</div>
+							</>
+						)}
 					</div>
 				)
 			}
