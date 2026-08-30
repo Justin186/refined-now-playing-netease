@@ -13,14 +13,53 @@ import { getSetting } from './utils.js';
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
 
-// 从 LibFrontendPlay 获取当前播放的 <audio> 元素
+// 音频 Blob 内存缓存：避免同一首歌重复下载浪费流量。
+// key 为在线歌曲的 audio.src 或本地文件的 localPath，value 为下载好的完整 Blob。
+// 只缓存最近几首，防止内存无限增长。
+const audioBlobCache = new Map();
+const AUDIO_CACHE_MAX = 5;
+
+// 获取音频缓存 key（在线用 src，本地用 localPath）
+const getAudioCacheKey = (audio, localPath) => localPath || audio?.src || null;
+
+// 写入缓存（超出上限时淘汰最旧的）
+const cacheAudioBlob = (key, blob) => {
+	if (!key || !blob) return;
+	audioBlobCache.set(key, blob);
+	if (audioBlobCache.size > AUDIO_CACHE_MAX) {
+		const oldestKey = audioBlobCache.keys().next().value;
+		audioBlobCache.delete(oldestKey);
+	}
+};
+
+// 读取缓存
+const getCachedAudioBlob = (key) => (key ? audioBlobCache.get(key) : null);
+
+// 从 LibFrontendPlay 获取当前播放的 <audio> 元素及本地文件路径（若有）
+// 返回 { audio, localPath }：
+//   - audio: 当前播放的 <audio> 元素
+//   - localPath: 若为本地文件则返回原始路径（用于 betterncm.fs.readFile），否则为 null
 const getCurrentAudio = () => {
 	try {
 		const plugin = window.loadedPlugins?.['LibFrontendPlay'];
 		if (!plugin || !plugin.enabled) return null;
 		const audio = plugin.currentAudioPlayer;
 		if (!audio || !audio.src) return null;
-		return audio;
+
+		// 从 LibFrontendPlay 的 info.url 解析本地文件路径
+		// 在线歌曲: info.url = "(online) <musicurl>"
+		// 本地歌曲: info.url = "(local) <path>"
+		let localPath = null;
+		try {
+			const infoUrl = plugin.info?.url ?? '';
+			if (typeof infoUrl === 'string' && infoUrl.startsWith('(local)')) {
+				localPath = infoUrl.replace(/^\(local\)\s*/, '').trim() || null;
+			}
+		} catch (e) {
+			// 忽略解析失败
+		}
+
+		return { audio, localPath };
 	} catch (e) {
 		console.warn('[AI Lyric] 获取 LibFrontendPlay 音频失败', e);
 		return null;
@@ -57,7 +96,7 @@ const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
 
 // 把解析后的歌词行拼成带换行的纯文本（仅原文，按时间顺序）
 const buildOriginalLyricText = (lyrics) => {
-	if (!Array.isArray(lyrics)) return { text: '', times: [] };
+	if (!Array.isArray(lyrics)) return { text: '', times: [], start: 0 };
 	const lines = lyrics.map((line) => line?.originalLyric ?? '');
 	// 去掉首尾空行，保持与后端 raw_lines 一致
 	let start = 0, end = lines.length;
@@ -68,6 +107,8 @@ const buildOriginalLyricText = (lyrics) => {
 		text: trimmed.join('\n').trim(),
 		// 每行参考时间（秒），对应后端 raw_lines 的每一行
 		times: trimmed.map((_, i) => (lyrics[start + i]?.time ?? 0) / 1000),
+		// 发送文本第一行对应原始歌词的索引（用于按行号一一对应）
+		start,
 	};
 };
 
@@ -96,11 +137,12 @@ const findActiveBackendPort = async (startPort = AI_BACKEND_START_PORT, maxTries
 };
 
 // 把音频 blob + 歌词文本发送到后端，返回 { standardLrc, enhancedLrc }
-const requestAILyric = async (audioBlob, originalLyricText, songInfo, times) => {
+// audioFileName 用于让后端识别音频格式（在线歌曲默认 audio.bin，本地文件用其扩展名）
+const requestAILyric = async (audioBlob, originalLyricText, songInfo, times, audioFileName = 'audio.bin') => {
 	const activePort = await findActiveBackendPort();
 
 	const formData = new FormData();
-	formData.append('audio', audioBlob, 'audio.bin');
+	formData.append('audio', audioBlob, audioFileName);
 	formData.append('lyrics', originalLyricText);
 	if (Array.isArray(times) && times.length > 0) {
 		formData.append('times', JSON.stringify(times));
@@ -148,10 +190,16 @@ const parseEnhancedLrc = (lrc) => {
 	lrc.split('\n').forEach((lineStr) => {
 		const line = { time: 0, words: [] };
 		const lineStartMatch = lineStartReg.exec(lineStr);
+		const hasLineStart = lineStartMatch !== null;
 		let nextStart = lineStartMatch
 			? parseInt(lineStartMatch[1]) * 60 + parseFloat(lineStartMatch[2])
 			: null;
 		if (nextStart !== null) line.time = Math.round(nextStart * 1000);
+
+		// 行内容（去掉行首时间戳后的剩余文本），用于判断是否为空行
+		const content = lineStartMatch
+			? lineStr.slice(lineStartMatch[0].length).trim()
+			: lineStr.trim();
 
 		let match;
 		wordReg.lastIndex = 0;
@@ -179,10 +227,14 @@ const parseEnhancedLrc = (lrc) => {
 			// 有第二个时间戳说明词间有停顿，下一词从该时间戳开始；否则无缝衔接
 			nextStart = stamps.length > 1 ? stamps[1] : end;
 		}
-		if (line.words.length > 0) {
+		// 保留有逐字词的行，或带行开始时间戳且有实际文本内容的行（元数据行/间奏行）
+		// 忽略纯空行（如 [01:04.88] 只有空格）——它们会导致翻译/罗马音错位
+		if (line.words.length > 0 || (hasLineStart && content.length > 0)) {
 			// 行结束时间 = 最后一个词的结束时间
 			const lastWord = line.words[line.words.length - 1];
-			line.end = lastWord.time + lastWord.duration;
+			if (lastWord) {
+				line.end = lastWord.time + lastWord.duration;
+			}
 			lines.push(line);
 		}
 	});
@@ -242,7 +294,8 @@ const parseStandardLrc = (lrc) => {
 			timeReg.lastIndex = match.index;
 		}
 		text = text.trim();
-		if (!text) continue;
+		// 保留空行（间奏行）：有时间戳但无文本
+		if (!text && times.length === 0) continue;
 		for (const time of times) {
 			lines.push({ time, lyric: text });
 		}
@@ -250,122 +303,90 @@ const parseStandardLrc = (lrc) => {
 	return lines.sort((a, b) => a.time - b.time);
 };
 
-// 计算两段文本的相似度（0~1），用于判断标准行是否与原始行匹配
-const calcSimilarity = (a, b) => {
-	if (!a || !b) return 0;
-	a = a.trim();
-	b = b.trim();
-	if (a === b) return 1;
-	if (a.length === 0 || b.length === 0) return 0;
-	// 字符集合交集比例
-	const setA = new Set(a);
-	const setB = new Set(b);
-	let common = 0;
-	for (const ch of setA) {
-		if (setB.has(ch)) common++;
-	}
-	return common / Math.max(setA.size, setB.size);
-};
-
-// 判断是否为元数据行（作詞/作曲/編曲等 Staff 信息），这些行不应被标准 LRC 覆盖文本或附加逐字
+// 判断是否为元数据行（作詞/作曲/編曲等 Staff 信息），这些行应显示自己的文本，只是不附加逐字
 const isMetadataLine = (text) => {
 	if (!text) return false;
 	return /^(作詞|作曲|編曲|作词|作曲|编曲|作詞者|作曲者|編曲者|作词者|作曲者|编曲者|歌詞|歌词|訳詞|译词|翻譯|翻译|原唱|演唱|製作|制作|監製|监制|企劃|企划|出品|发行|發行|原曲|和声|和聲|伴唱|混音|母带|母帶|录音|錄音|制作人|製作人)[:：]/.test(text);
 };
 
-// 拼接增强行的完整文本（用于文本相似度决胜）
-const enhLineText = (line) => (line?.words ?? []).map((w) => w.word).join('').trim();
-
 // 把逐字歌词行对齐到标准 LRC 行，重建歌词数组
 // 以原歌词为基础（保留所有行，包括元数据/间奏），用标准 LRC 修正文本和时间，
 // 用增强 LRC 提供逐字数据（dynamicLyric）
 //
-// 关键：用双指针（enhIdx/stdIdx）按时间顺序把增强行/标准行依次分配给原始行，
-// 保证一一对应。否则若后端返回多行相同时间戳的逐字行（如 [02:10.18] 连续多行），
-// 按"最近时间"独立匹配会把多行全部匹配到第一行，导致逐字错乱/串行。
-// 时间相同时用文本相似度决胜，避免同时间戳行被错误消费。
-const mergeLyrics = (standardLines, enhancedLines, originalLyrics) => {
-	// 按时间排序，保证双指针按时间顺序一一对应
-	const sortedEnhanced = [...enhancedLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
-	const sortedStandard = [...standardLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+// 核心前提：后端是基于我们发送的原始歌词文本做对齐的，返回的 standard_lrc /
+// enhanced_lrc 行数与发送文本一致（含间奏空行/元数据行），每行按行号一一对应，
+// 因此直接按 index 对齐即可，无需任何时间/文本匹配。
+// 所有行（含元数据行/间奏空行）都用标准行文本和时间；元数据行不附加逐字。
+const mergeLyrics = (standardLines, enhancedLines, originalLyrics, startOffset = 0) => {
+	// 过滤掉后端插入的间奏空行（standard 中无文本的行），
+	// 保证与 enhancedLines（parseEnhancedLrc 已忽略纯空行）行数一致、按行号一一对应
+	const stdContent = standardLines.filter((l) => l.lyric.trim().length > 0);
 
-	let enhIdx = 0;
-	let stdIdx = 0;
-
-	return originalLyrics.map((origLine) => {
-		const origTime = origLine.time ?? 0;
-		const origText = (origLine.originalLyric ?? '').trim();
-		const isInterlude = origLine.isInterlude || !origText;
-
-		// 标准行：双指针推进，找到时间最接近且不回头；时间相同时用文本相似度决胜
-		let stdLine = null;
-		let stdDiff = Infinity;
-		while (stdIdx < sortedStandard.length) {
-			const cur = sortedStandard[stdIdx];
-			const diff = Math.abs((cur.time ?? 0) - origTime);
-			if (diff < stdDiff) {
-				stdDiff = diff;
-				stdLine = cur;
-				stdIdx++;
-			} else if (diff === stdDiff && stdLine) {
-				// 时间相同，用文本相似度决胜
-				const curSim = calcSimilarity(cur.lyric, origText);
-				const stdSim = calcSimilarity(stdLine.lyric, origText);
-				if (curSim > stdSim) {
-					stdLine = cur;
-				}
-				stdIdx++;
-			} else {
-				break;
-			}
-		}
-
-		// 增强行：双指针推进（仅对真正的歌词行消费增强行，间奏/空行不消费）
-		// 时间相同时用文本相似度决胜，避免多行同时间戳时全部串到第一行
-		let best = null;
-		let bestDiff = Infinity;
-		if (!isInterlude) {
-			while (enhIdx < sortedEnhanced.length - 1) {
-				const cur = sortedEnhanced[enhIdx];
-				const next = sortedEnhanced[enhIdx + 1];
-				const curDiff = Math.abs((cur.time ?? 0) - origTime);
-				const nextDiff = Math.abs((next.time ?? 0) - origTime);
-				if (nextDiff < curDiff) {
-					enhIdx++;
-				} else if (nextDiff === curDiff) {
-					// 时间相同，用文本相似度决胜
-					const curSim = calcSimilarity(enhLineText(cur), origText);
-					const nextSim = calcSimilarity(enhLineText(next), origText);
-					if (nextSim > curSim) {
-						enhIdx++;
-					} else {
-						break;
-					}
-				} else {
-					break;
-				}
-			}
-			if (enhIdx < sortedEnhanced.length) {
-				best = sortedEnhanced[enhIdx];
-				bestDiff = Math.abs((best.time ?? 0) - origTime);
-			}
-		}
-
-		// 保留原歌词所有字段（翻译/罗马音/间奏等）
+	// 原始歌词中非空行按顺序消费后端内容行（原始空行/间奏保持原样，不消费后端行）
+	let contentIdx = startOffset;
+	return originalLyrics.map((origLine, i) => {
 		const base = { ...origLine };
-		// 用标准行修正文本和时间（时间接近、文本相似且非元数据行才覆盖，避免错位/元数据被错误替换）
-		if (stdLine && stdDiff < 3000 && !isMetadataLine(origLine.originalLyric) && calcSimilarity(stdLine.lyric, origLine.originalLyric) >= 0.5) {
-			base.originalLyric = stdLine.lyric;
-			base.time = stdLine.time;
+		// 原始空行（间奏）保持原样
+		if ((origLine.originalLyric ?? '').trim().length === 0) return base;
+
+		const idx = contentIdx - startOffset;
+		contentIdx++;
+		// 超出后端返回范围的行（首尾空行）保持原样
+		if (idx < 0 || idx >= stdContent.length) {
+			console.log(`[AI Lyric] merge[${i}] idx=${idx} 越界，保持原样 text=${JSON.stringify(base.originalLyric)}`);
+			return base;
 		}
-		// 只有匹配到时间接近的逐字行（说明是真正的歌词行）才附加逐字数据
-		if (best && best.words && best.words.length > 0 && bestDiff < 3000 && !isMetadataLine(origLine.originalLyric)) {
-			base.duration = (best.end ?? best.time ?? base.time) - (best.time ?? base.time);
-			base.dynamicLyric = best.words;
-			base.dynamicLyricTime = best.time ?? base.time;
+
+		const stdLine = stdContent[idx];
+		const isMeta = isMetadataLine(stdLine.lyric);
+
+		// 标准行修正文本和时间（所有行都显示标准行文本，包括元数据行/间奏空行）
+		base.originalLyric = stdLine.lyric;
+		base.time = stdLine.time;
+
+		// 附加逐字数据（元数据行不需要逐字）
+		let enhText = '(无逐字)'; // 调试用：记录附加的逐字文本
+		if (!isMeta && idx < enhancedLines.length) {
+			const enhLine = enhancedLines[idx];
+			if (enhLine && enhLine.words && enhLine.words.length > 0) {
+				base.duration = (enhLine.end ?? enhLine.time ?? base.time) - (enhLine.time ?? base.time);
+				base.dynamicLyric = enhLine.words;
+				base.dynamicLyricTime = enhLine.time ?? base.time;
+				enhText = JSON.stringify(enhLine.words.map((w) => w.word).join('').trim());
+			}
 		}
+		console.log(`[AI Lyric] merge[${i}] idx=${idx} std=${JSON.stringify(stdLine.lyric)} enh=${enhText}${isMeta ? ' (元数据)' : ''}`);
 		return base;
 	});
+};
+
+// 把歌词数组转成 YRC 格式文本（用于调试输出逐字数据）
+// YRC 格式：普通行 [mm:ss.xx]文本[mm:ss.xx]；逐字行 [mm:ss.xx]词1[mm:ss.xx]词2[mm:ss.xx]...
+const buildYrcDebug = (lyrics) => {
+	const fmt = (ms) => {
+		const m = Math.floor(ms / 60000);
+		const s = (ms % 60000) / 1000;
+		return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
+	};
+	return lyrics.map((line, i) => {
+		const time = line.time ?? 0;
+		const words = line.dynamicLyric;
+		if (words && words.length > 0) {
+			// 逐字行：行开始时间 + 每个词 + 词结束时间
+			let str = `[${fmt(time)}]`;
+			let prevEnd = time;
+			for (const w of words) {
+				const wStart = w.time ?? prevEnd;
+				const wEnd = wStart + (w.duration ?? 0);
+				str += `${w.word}[${fmt(wEnd)}]`;
+				prevEnd = wEnd;
+			}
+			return str;
+		}
+		// 普通行（元数据行/间奏空行）：显示完整文本，结束时间 = 下一行开始时间
+		const nextTime = lyrics[i + 1]?.time;
+		return `[${fmt(time)}]${line.originalLyric ?? ''}${nextTime != null ? `[${fmt(nextTime)}]` : ''}`;
+	}).join('\n');
 };
 
 // 从 betterncm 获取当前歌曲信息（歌名/歌手/专辑）
@@ -392,14 +413,20 @@ export async function applyAILyric(lyrics) {
 	}
 
 	// 1. 没有歌词文本就不处理
-	const { text: originalLyricText, times } = buildOriginalLyricText(lyrics);
+	const { text: originalLyricText, times, start } = buildOriginalLyricText(lyrics);
 	if (!originalLyricText) {
 		console.log('[AI Lyric] 歌曲没有歌词文本，跳过 AI 处理');
 		return null;
 	}
 
-	// 2. 获取当前音频
-	const audio = getCurrentAudio();
+	// 调试：输出发送给后端的原始歌词（带行号），便于核对后端返回的行对应关系
+	console.log(`[AI Lyric] 发送给后端的原始歌词 (start=${start}, 共 ${lyrics.length} 行):`);
+	lyrics.forEach((line, i) => {
+		console.log(`  [${i}] time=${((line.time ?? 0) / 1000).toFixed(2)}s text=${JSON.stringify(line.originalLyric ?? '')}`);
+	});
+
+	// 2. 获取当前音频及本地路径
+	const { audio, localPath } = getCurrentAudio() ?? {};
 	if (!audio) {
 		console.log('[AI Lyric] 未找到 LibFrontendPlay 音频，跳过 AI 处理');
 		return null;
@@ -408,35 +435,56 @@ export async function applyAILyric(lyrics) {
 	// 3. 只等音频元数据就绪（确保 src 已切换到新歌），不等待缓冲完整
 	await waitForAudioMetadata(audio);
 
-	// 4. 直接下载完整音频 blob（带重试）
-	//    关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
-	//    可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
-	//    因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
-	//    fetch 下载完成即代表音频完整，无需依赖 audio 元素的流式缓冲。
-	let audioBlob;
-	let downloadOk = false;
+	// 4. 获取完整音频 blob（带重试 + 内存缓存）
+	//    在线歌曲：audio.src 是 http(s) CDN 地址，用 fetch 下载。
+	//    本地歌曲：audio.src 是 orpheus:// 等自定义协议，fetch 无法访问（Failed to fetch），
+	//              需从 LibFrontendPlay 的 info.url 解析本地路径，用 betterncm.fs.readFile 读取完整文件。
+	//    缓存：同一首歌（相同 src/localPath）重复播放时直接复用，避免重复下载浪费流量。
+	const cacheKey = getAudioCacheKey(audio, localPath);
+	let audioBlob = getCachedAudioBlob(cacheKey);
+	let downloadOk = !!audioBlob;
+	if (downloadOk) {
+		console.log('[AI Lyric] 命中音频缓存，跳过下载');
+	}
 	for (let attempt = 0; attempt < 3 && !downloadOk; attempt++) {
 		try {
-			const res = await fetch(audio.src, { cache: 'no-store' });
-			if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
-			// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
-			if (res.status === 206) {
-				throw new Error('音频下载返回部分内容 (206)，可能不完整');
+			if (localPath) {
+				// 本地文件：用 betterncm.fs.readFile 读取完整 Blob
+				if (!betterncm?.fs?.readFile) {
+					throw new Error('betterncm.fs.readFile 不可用');
+				}
+				audioBlob = await betterncm.fs.readFile(localPath);
+				if (!audioBlob || audioBlob.size < 1024) {
+					throw new Error(`本地音频数据过小 (${audioBlob?.size ?? 0} bytes)，可能不完整`);
+				}
+			} else {
+				// 在线歌曲：fetch 下载完整文件
+				// 关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
+				// 可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
+				// 因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
+				const res = await fetch(audio.src, { cache: 'no-store' });
+				if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
+				// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
+				if (res.status === 206) {
+					throw new Error('音频下载返回部分内容 (206)，可能不完整');
+				}
+				const blob = await res.blob();
+				// 用 Content-Length 校验完整性：实际大小与声明大小不一致说明下载被截断
+				const contentLength = Number(res.headers.get('Content-Length'));
+				if (contentLength > 0 && blob.size !== contentLength) {
+					throw new Error(`音频数据不完整 (${blob.size}/${contentLength} bytes)`);
+				}
+				// 简单完整性检查：blob 太小可能是不完整数据
+				if (blob.size < 1024) {
+					throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
+				}
+				audioBlob = blob;
 			}
-			const blob = await res.blob();
-			// 用 Content-Length 校验完整性：实际大小与声明大小不一致说明下载被截断
-			const contentLength = Number(res.headers.get('Content-Length'));
-			if (contentLength > 0 && blob.size !== contentLength) {
-				throw new Error(`音频数据不完整 (${blob.size}/${contentLength} bytes)`);
-			}
-			// 简单完整性检查：blob 太小可能是不完整数据
-			if (blob.size < 1024) {
-				throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
-			}
-			audioBlob = blob;
+			// 下载/读取成功，写入缓存
+			cacheAudioBlob(cacheKey, audioBlob);
 			downloadOk = true;
 		} catch (e) {
-			console.warn(`[AI Lyric] 下载音频失败 (第 ${attempt + 1} 次)`, e);
+			console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
 			if (attempt < 2) {
 				// 等待后重试
 				await new Promise((r) => setTimeout(r, 1500));
@@ -445,16 +493,19 @@ export async function applyAILyric(lyrics) {
 		}
 	}
 	if (!downloadOk) {
-		console.warn('[AI Lyric] 多次下载音频失败，跳过 AI 处理');
+		console.warn('[AI Lyric] 多次获取音频失败，跳过 AI 处理');
 		return null;
 	}
 
 	// 5. 请求后端，同时获取标准 LRC 和逐字 LRC（带重试）
+	//    本地文件用其扩展名作为音频文件名，便于后端识别格式
+	const extMatch = localPath ? localPath.match(/\.(\w+)$/) : null;
+	const audioFileName = extMatch ? `audio.${extMatch[1]}` : 'audio.bin';
 	let result;
 	let requestOk = false;
 	for (let attempt = 0; attempt < 2 && !requestOk; attempt++) {
 		try {
-			result = await requestAILyric(audioBlob, originalLyricText, getSongInfo(), times);
+			result = await requestAILyric(audioBlob, originalLyricText, getSongInfo(), times, audioFileName);
 			requestOk = true;
 		} catch (e) {
 			console.warn(`[AI Lyric] 请求后端失败 (第 ${attempt + 1} 次)`, e);
@@ -481,61 +532,46 @@ export async function applyAILyric(lyrics) {
 	console.log('[AI Lyric] standard_lrc:', result.standardLrc);
 	console.log('[AI Lyric] enhanced_lrc:', result.enhancedLrc);
 
+	// 调试：输出解析后的 standard/enhanced 行（带行号），核对逐字匹配
+	console.log(`[AI Lyric] standardLines (${standardLines.length} 行):`);
+	standardLines.forEach((l, i) => {
+		console.log(`  [${i}] time=${(l.time / 1000).toFixed(2)}s text=${JSON.stringify(l.lyric)}`);
+	});
+	console.log(`[AI Lyric] enhancedLines (${enhancedLines.length} 行):`);
+	enhancedLines.forEach((l, i) => {
+		const text = l.words.map((w) => w.word).join('').trim();
+		console.log(`  [${i}] time=${(l.time / 1000).toFixed(2)}s words=${l.words.length} text=${JSON.stringify(text)}`);
+	});
+
 	// 7. 用标准 LRC 重建歌词行结构，逐字数据对齐到标准行
 	//    优先使用标准 LRC 行（解决"一行显示多次"的行数不匹配问题），
 	//    并保留原歌词的翻译/罗马音字段
 	let newLyrics;
 	if (standardLines.length > 0) {
-		newLyrics = mergeLyrics(standardLines, enhancedLines, lyrics);
+		newLyrics = mergeLyrics(standardLines, enhancedLines, lyrics, start);
 	} else {
-		// 后端未返回标准 LRC 时，退回按时间匹配原歌词行
-		// 同样用双指针保证一一对应，避免多行同时间戳时全部串到第一行
-		const sortedEnhanced = [...enhancedLines].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
-		let enhIdx = 0;
-		newLyrics = lyrics.map((line) => {
-			const origTime = line.time ?? 0;
-			const origText = (line.originalLyric ?? '').trim();
-			const isInterlude = line.isInterlude || !origText;
-			let best = null;
-			let bestDiff = Infinity;
-			if (!isInterlude) {
-				while (enhIdx < sortedEnhanced.length - 1) {
-					const cur = sortedEnhanced[enhIdx];
-					const next = sortedEnhanced[enhIdx + 1];
-					const curDiff = Math.abs((cur.time ?? 0) - origTime);
-					const nextDiff = Math.abs((next.time ?? 0) - origTime);
-					if (nextDiff < curDiff) {
-						enhIdx++;
-					} else if (nextDiff === curDiff) {
-						const curSim = calcSimilarity(enhLineText(cur), origText);
-						const nextSim = calcSimilarity(enhLineText(next), origText);
-						if (nextSim > curSim) {
-							enhIdx++;
-						} else {
-							break;
-						}
-					} else {
-						break;
-					}
-				}
-				if (enhIdx < sortedEnhanced.length) {
-					best = sortedEnhanced[enhIdx];
-					bestDiff = Math.abs((best.time ?? 0) - origTime);
-				}
-			}
-			if (best && best.words && best.words.length > 0 && bestDiff < 3000 && !isMetadataLine(line.originalLyric)) {
-				return {
-					...line,
-					originalLyric: best.words.map((w) => w.word).join('').trim(),
-					dynamicLyric: best.words,
-					dynamicLyricTime: best.time ?? line.time,
-					duration: (best.end ?? best.time ?? line.time) - (best.time ?? line.time),
-				};
-			}
-			return line;
+		// 后端未返回标准 LRC 时，退回按行号对应原歌词行
+		let contentIdx = start;
+		newLyrics = lyrics.map((line, i) => {
+			// 原始空行（间奏）保持原样，不消费后端行
+			if ((line.originalLyric ?? '').trim().length === 0) return line;
+			const idx = contentIdx - start;
+			contentIdx++;
+			if (idx < 0 || idx >= enhancedLines.length) return line;
+			const enhLine = enhancedLines[idx];
+			if (!enhLine || !enhLine.words || enhLine.words.length === 0) return line;
+			if (isMetadataLine(line.originalLyric)) return line;
+			return {
+				...line,
+				originalLyric: enhLine.words.map((w) => w.word).join('').trim(),
+				dynamicLyric: enhLine.words,
+				dynamicLyricTime: enhLine.time ?? line.time,
+				duration: (enhLine.end ?? enhLine.time ?? line.time) - (enhLine.time ?? line.time),
+			};
 		});
 	}
 
 	console.log('[AI Lyric] 已应用 AI 逐字歌词');
+	console.log('[AI Lyric] YRC 调试输出:\n' + buildYrcDebug(newLyrics));
 	return newLyrics;
 }

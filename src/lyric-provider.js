@@ -83,6 +83,9 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 		}
 	}
 
+	// 调试：输出 hijack 前的官方 YRC（网易云原始逐字歌词）
+	console.log('[Lyric] 官方 YRC (hijack前):', rawLyrics?.yrc?.lyric);
+
 	if ((rawLyrics?.lrc?.lyric ?? '') != currentRawLRC) {
 		console.log('Update Raw Lyrics', rawLyrics);
 		currentRawLRC = (rawLyrics?.lrc?.lyric ?? '') ;
