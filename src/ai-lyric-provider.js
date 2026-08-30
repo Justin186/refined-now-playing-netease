@@ -304,7 +304,7 @@ const parseStandardLrc = (lrc) => {
 };
 
 // 判断是否为元数据行（作詞/作曲/編曲等 Staff 信息），这些行应显示自己的文本，只是不附加逐字
-const isMetadataLine = (text) => {
+export const isMetadataLine = (text) => {
 	if (!text) return false;
 	return /^(作詞|作曲|編曲|作词|作曲|编曲|作詞者|作曲者|編曲者|作词者|作曲者|编曲者|歌詞|歌词|訳詞|译词|翻譯|翻译|原唱|演唱|製作|制作|監製|监制|企劃|企划|出品|发行|發行|原曲|和声|和聲|伴唱|混音|母带|母帶|录音|錄音|制作人|製作人)[:：]/.test(text);
 };
@@ -333,7 +333,6 @@ const mergeLyrics = (standardLines, enhancedLines, originalLyrics, startOffset =
 		contentIdx++;
 		// 超出后端返回范围的行（首尾空行）保持原样
 		if (idx < 0 || idx >= stdContent.length) {
-			console.log(`[AI Lyric] merge[${i}] idx=${idx} 越界，保持原样 text=${JSON.stringify(base.originalLyric)}`);
 			return base;
 		}
 
@@ -344,49 +343,24 @@ const mergeLyrics = (standardLines, enhancedLines, originalLyrics, startOffset =
 		base.originalLyric = stdLine.lyric;
 		base.time = stdLine.time;
 
+		// 元数据行不附加逐字，并清除原始歌词行（官方 YRC）自带的 dynamicLyric
+		if (isMeta) {
+			delete base.dynamicLyric;
+			delete base.dynamicLyricTime;
+			delete base.duration;
+		}
+
 		// 附加逐字数据（元数据行不需要逐字）
-		let enhText = '(无逐字)'; // 调试用：记录附加的逐字文本
 		if (!isMeta && idx < enhancedLines.length) {
 			const enhLine = enhancedLines[idx];
 			if (enhLine && enhLine.words && enhLine.words.length > 0) {
 				base.duration = (enhLine.end ?? enhLine.time ?? base.time) - (enhLine.time ?? base.time);
 				base.dynamicLyric = enhLine.words;
 				base.dynamicLyricTime = enhLine.time ?? base.time;
-				enhText = JSON.stringify(enhLine.words.map((w) => w.word).join('').trim());
 			}
 		}
-		console.log(`[AI Lyric] merge[${i}] idx=${idx} std=${JSON.stringify(stdLine.lyric)} enh=${enhText}${isMeta ? ' (元数据)' : ''}`);
 		return base;
 	});
-};
-
-// 把歌词数组转成 YRC 格式文本（用于调试输出逐字数据）
-// YRC 格式：普通行 [mm:ss.xx]文本[mm:ss.xx]；逐字行 [mm:ss.xx]词1[mm:ss.xx]词2[mm:ss.xx]...
-const buildYrcDebug = (lyrics) => {
-	const fmt = (ms) => {
-		const m = Math.floor(ms / 60000);
-		const s = (ms % 60000) / 1000;
-		return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
-	};
-	return lyrics.map((line, i) => {
-		const time = line.time ?? 0;
-		const words = line.dynamicLyric;
-		if (words && words.length > 0) {
-			// 逐字行：行开始时间 + 每个词 + 词结束时间
-			let str = `[${fmt(time)}]`;
-			let prevEnd = time;
-			for (const w of words) {
-				const wStart = w.time ?? prevEnd;
-				const wEnd = wStart + (w.duration ?? 0);
-				str += `${w.word}[${fmt(wEnd)}]`;
-				prevEnd = wEnd;
-			}
-			return str;
-		}
-		// 普通行（元数据行/间奏空行）：显示完整文本，结束时间 = 下一行开始时间
-		const nextTime = lyrics[i + 1]?.time;
-		return `[${fmt(time)}]${line.originalLyric ?? ''}${nextTime != null ? `[${fmt(nextTime)}]` : ''}`;
-	}).join('\n');
 };
 
 // 从 betterncm 获取当前歌曲信息（歌名/歌手/专辑）
@@ -418,12 +392,6 @@ export async function applyAILyric(lyrics) {
 		console.log('[AI Lyric] 歌曲没有歌词文本，跳过 AI 处理');
 		return null;
 	}
-
-	// 调试：输出发送给后端的原始歌词（带行号），便于核对后端返回的行对应关系
-	console.log(`[AI Lyric] 发送给后端的原始歌词 (start=${start}, 共 ${lyrics.length} 行):`);
-	lyrics.forEach((line, i) => {
-		console.log(`  [${i}] time=${((line.time ?? 0) / 1000).toFixed(2)}s text=${JSON.stringify(line.originalLyric ?? '')}`);
-	});
 
 	// 2. 获取当前音频及本地路径
 	const { audio, localPath } = getCurrentAudio() ?? {};
@@ -528,20 +496,11 @@ export async function applyAILyric(lyrics) {
 	}
 	enhancedLines.forEach((l) => postProcessDynamicLyric([l]));
 
-	// 调试：输出后端返回的原始 LRC，便于排查元数据行/英文空格问题
-	console.log('[AI Lyric] standard_lrc:', result.standardLrc);
-	console.log('[AI Lyric] enhanced_lrc:', result.enhancedLrc);
-
-	// 调试：输出解析后的 standard/enhanced 行（带行号），核对逐字匹配
-	console.log(`[AI Lyric] standardLines (${standardLines.length} 行):`);
-	standardLines.forEach((l, i) => {
-		console.log(`  [${i}] time=${(l.time / 1000).toFixed(2)}s text=${JSON.stringify(l.lyric)}`);
-	});
-	console.log(`[AI Lyric] enhancedLines (${enhancedLines.length} 行):`);
-	enhancedLines.forEach((l, i) => {
-		const text = l.words.map((w) => w.word).join('').trim();
-		console.log(`  [${i}] time=${(l.time / 1000).toFixed(2)}s words=${l.words.length} text=${JSON.stringify(text)}`);
-	});
+	// 调试：输出后端返回的原始 LRC（由设置中的"AI 逐字歌词调试输出"开关控制）
+	if (getSetting('ai-lyric-debug', false)) {
+		console.log('[AI Lyric] standard_lrc:', result.standardLrc);
+		console.log('[AI Lyric] enhanced_lrc:', result.enhancedLrc);
+	}
 
 	// 7. 用标准 LRC 重建歌词行结构，逐字数据对齐到标准行
 	//    优先使用标准 LRC 行（解决"一行显示多次"的行数不匹配问题），
@@ -572,6 +531,5 @@ export async function applyAILyric(lyrics) {
 	}
 
 	console.log('[AI Lyric] 已应用 AI 逐字歌词');
-	console.log('[AI Lyric] YRC 调试输出:\n' + buildYrcDebug(newLyrics));
 	return newLyrics;
 }

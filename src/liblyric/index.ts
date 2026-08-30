@@ -180,6 +180,12 @@ export function parseLyric(
 							target = v;
 						}
 					});
+					// 'closest' 模式下，若最近翻译行与原文行时间差过大（>1s），
+					// 说明该原文行没有对应翻译（如作词/作曲无翻译），不附加，
+					// 避免把不相关的原文行错误拼接到某个翻译行上导致相似度匹配错乱
+					if (target && Math.abs((target as LyricPureLine).time - line.time) > 1000) {
+						target = null;
+					}
 				}
 					
 				//console.log(line, target);
@@ -248,7 +254,6 @@ export function parseLyric(
 				}
 
 				//console.log(targetIndex);
-
 				const target = processed[targetIndex];
 
 				//console.log(targetIndex, target);
@@ -265,7 +270,6 @@ export function parseLyric(
 		const rawParsed = attachOriginalLyric(parsePureLyric(original));
 
 		//console.log("translatedParsed", JSON.parse(JSON.stringify(translatedParsed)));
-
 		attachLyricToDynamic(translatedParsed, 'translatedLyric');
 		attachLyricToDynamic(romanParsed, 'romanLyric');
 		attachLyricToDynamic(rawParsed, 'rawLyric');

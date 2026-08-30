@@ -500,10 +500,15 @@ const addSettingsMenu = async (isFM = false) => {
 		const lyricGlow = getOptionDom('#lyric-glow');
 		const lyricContributorsDisplay = getOptionDom('#lyric-contributors-display');
 		const aiLyric = getOptionDom('#ai-lyric');
+		const aiLyricDebug = getOptionDom('#ai-lyric-debug');
 		
 
 		bindCheckboxToFunction(aiLyric, (x) => {
 			window.aiLyricEnabled = x;
+		}, false);
+
+		bindCheckboxToFunction(aiLyricDebug, (x) => {
+			window.aiLyricDebugEnabled = x;
 		}, false);
 
 		bindCheckboxToClass(originalLyricBold, 'original-lyric-bold', true);

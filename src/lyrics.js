@@ -466,15 +466,35 @@ export function Lyrics(props) {
 			cur = _lyrics.current.length;
 		}
 	
-		let curForScrolling = Math.max(0, cur - 1);
-		const scrollingDelay = lyricStagger ? 200 : 0;
-		for (let i = startIndex; i < _lyrics.current.length; i++) {
-			if (_lyrics.current[i].time <= currentTimeWithOffset + scrollingDelay) {
-				curForScrolling = i;
-			} else {
-				break;
-			}
+	// 元数据行（作词/作曲/编曲等）快速跳过：开头的连续元数据行每行只显示 1 秒，
+	// 之后跳到第一个非元数据行，不占用正常歌词位置
+	const metadataDisplayDuration = 1000;
+	const applyMetadataQuickPass = (idx) => {
+		if (!_lyrics.current || _lyrics.current.length === 0) return idx;
+		let leadingMetaCount = 0;
+		while (leadingMetaCount < _lyrics.current.length && _lyrics.current[leadingMetaCount]?.isMetadata) {
+			leadingMetaCount++;
 		}
+		if (leadingMetaCount === 0) return idx;
+		const firstMetaTime = _lyrics.current[0].time;
+		const elapsed = currentTimeWithOffset - firstMetaTime;
+		if (elapsed < leadingMetaCount * metadataDisplayDuration) {
+			return Math.min(Math.floor(elapsed / metadataDisplayDuration), leadingMetaCount - 1);
+		}
+		return Math.max(idx, leadingMetaCount);
+	};
+	cur = applyMetadataQuickPass(cur);
+
+	let curForScrolling = Math.max(0, cur - 1);
+	const scrollingDelay = lyricStagger ? 200 : 0;
+	for (let i = startIndex; i < _lyrics.current.length; i++) {
+		if (_lyrics.current[i].time <= currentTimeWithOffset + scrollingDelay) {
+			curForScrolling = i;
+		} else {
+			break;
+		}
+	}
+	curForScrolling = applyMetadataQuickPass(curForScrolling);
 		
 		shouldTransit.current = true;
 		if (!_scrollingMode.current) {

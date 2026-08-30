@@ -3,7 +3,7 @@
 
 import { parseLyric } from './liblyric/index.ts'
 import { cyrb53, getSetting } from './utils.js'
-import { applyAILyric } from './ai-lyric-provider.js'
+import { applyAILyric, isMetadataLine } from './ai-lyric-provider.js'
 
 const preProcessLyrics = (lyrics) => {
 	if (!lyrics) return null;
@@ -36,6 +36,9 @@ const processLyrics = (lyrics) => {
 	for (const line of lyrics) {
 		if (line.originalLyric == '') {
 			line.isInterlude = true;
+		}
+		if (isMetadataLine(line.originalLyric)) {
+			line.isMetadata = true; // 元数据行（作词/作曲/编曲等）：时间线里快速跳过
 		}
 	}
 	/*for (const line of lyrics) {
@@ -84,10 +87,7 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 	}
 
 	// 调试：输出 hijack 前的官方 YRC（网易云原始逐字歌词）
-	console.log('[Lyric] 官方 YRC (hijack前):', rawLyrics?.yrc?.lyric);
-
 	if ((rawLyrics?.lrc?.lyric ?? '') != currentRawLRC) {
-		console.log('Update Raw Lyrics', rawLyrics);
 		currentRawLRC = (rawLyrics?.lrc?.lyric ?? '') ;
 		const preprocessedLyrics = preProcessLyrics(rawLyrics);
 		setTimeout(async () => {
@@ -146,11 +146,6 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 			}
 			lyrics.hash = `${betterncm.ncm.getPlaying().id}-${cyrb53(processedLyrics.map((x) => x.originalLyric).join('\\'))}`;
 			window.currentLyrics = lyrics;
-			console.group('Update Processed Lyrics');
-			console.log('lyrics', window.currentLyrics.lyrics);
-			console.log('contributors', window.currentLyrics.contributors);
-			console.log('hash', window.currentLyrics.hash);
-			console.groupEnd();
 			document.dispatchEvent(new CustomEvent('lyrics-updated', {detail: window.currentLyrics}));
 		}, 0);
 	}
