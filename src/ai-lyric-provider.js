@@ -27,67 +27,31 @@ const getCurrentAudio = () => {
 	}
 };
 
-// 等待音频完全缓冲加载好（readyState >= HAVE_ENOUGH_DATA 或 buffered 覆盖整个时长）
-// 避免新歌曲刚切换时音频不完整导致后端解析出错
-const waitForAudioReady = async (audio, timeoutMs = 30000) => {
-	const HAVE_ENOUGH_DATA = 4;
-	const isFullyBuffered = () => {
-		try {
-			if (audio.readyState >= HAVE_ENOUGH_DATA) return true;
-			// 检查 buffered 是否覆盖整个时长
-			if (audio.duration > 0 && audio.buffered.length > 0) {
-				const lastEnd = audio.buffered.end(audio.buffered.length - 1);
-				if (lastEnd >= audio.duration - 0.5) return true;
-			}
-			return false;
-		} catch (e) {
-			return false;
-		}
-	};
-
-	// 等待元数据加载（duration 可用）
-	if (audio.readyState < 1) {
-		await new Promise((resolve) => {
-			const onLoaded = () => {
-				audio.removeEventListener('loadedmetadata', onLoaded);
-				resolve();
-			};
-			audio.addEventListener('loadedmetadata', onLoaded);
-			setTimeout(() => {
-				audio.removeEventListener('loadedmetadata', onLoaded);
-				resolve();
-			}, 5000);
-		});
-	}
-
-	if (isFullyBuffered()) return true;
+// 等待音频元数据就绪（duration 可用），确保 audio.src 已切换到新歌且可下载。
+// 注意：这里只等元数据，不等待缓冲完整——因为完整音频由后续 fetch 直接下载，
+// 下载完成即代表完整，无需依赖 audio 元素缓慢的流式缓冲（那会白白等几十秒）。
+const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
+	// 元数据已就绪（duration 可用）则直接返回
+	if (audio.readyState >= 1 && audio.duration > 0) return true;
 
 	return new Promise((resolve) => {
 		const timeout = setTimeout(() => {
 			cleanup();
-			console.warn('[AI Lyric] 等待音频缓冲超时，使用当前缓冲状态继续');
+			console.warn('[AI Lyric] 等待音频元数据超时，尝试直接下载');
 			resolve(false);
 		}, timeoutMs);
 
-		const onCanPlayThrough = () => {
+		const onLoaded = () => {
 			cleanup();
 			resolve(true);
-		};
-		const onProgress = () => {
-			if (isFullyBuffered()) {
-				cleanup();
-				resolve(true);
-			}
 		};
 
 		const cleanup = () => {
 			clearTimeout(timeout);
-			audio.removeEventListener('canplaythrough', onCanPlayThrough);
-			audio.removeEventListener('progress', onProgress);
+			audio.removeEventListener('loadedmetadata', onLoaded);
 		};
 
-		audio.addEventListener('canplaythrough', onCanPlayThrough);
-		audio.addEventListener('progress', onProgress);
+		audio.addEventListener('loadedmetadata', onLoaded);
 	});
 };
 
@@ -388,17 +352,30 @@ export async function applyAILyric(lyrics) {
 		return null;
 	}
 
-	// 3. 等待音频完全缓冲，避免新歌曲音频不完整导致后端解析出错
-	await waitForAudioReady(audio);
+	// 3. 只等音频元数据就绪（确保 src 已切换到新歌），不等待缓冲完整
+	await waitForAudioMetadata(audio);
 
-	// 4. 下载音频 blob（带重试，避免音频未完全就绪导致数据不完整）
+	// 4. 直接下载完整音频 blob（带重试）
+	//    关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
+	//    可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
+	//    因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
+	//    fetch 下载完成即代表音频完整，无需依赖 audio 元素的流式缓冲。
 	let audioBlob;
 	let downloadOk = false;
 	for (let attempt = 0; attempt < 3 && !downloadOk; attempt++) {
 		try {
-			const res = await fetch(audio.src);
+			const res = await fetch(audio.src, { cache: 'no-store' });
 			if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
+			// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
+			if (res.status === 206) {
+				throw new Error('音频下载返回部分内容 (206)，可能不完整');
+			}
 			const blob = await res.blob();
+			// 用 Content-Length 校验完整性：实际大小与声明大小不一致说明下载被截断
+			const contentLength = Number(res.headers.get('Content-Length'));
+			if (contentLength > 0 && blob.size !== contentLength) {
+				throw new Error(`音频数据不完整 (${blob.size}/${contentLength} bytes)`);
+			}
 			// 简单完整性检查：blob 太小可能是不完整数据
 			if (blob.size < 1024) {
 				throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
@@ -410,7 +387,7 @@ export async function applyAILyric(lyrics) {
 			if (attempt < 2) {
 				// 等待后重试
 				await new Promise((r) => setTimeout(r, 1500));
-				await waitForAudioReady(audio, 10000);
+				await waitForAudioMetadata(audio, 5000);
 			}
 		}
 	}
