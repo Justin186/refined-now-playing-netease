@@ -255,7 +255,7 @@ const parseEnhancedLrc = (lrc) => {
 		let match;
 		wordReg.lastIndex = 0;
 		while ((match = wordReg.exec(lineStr)) !== null) {
-			// 保留尾空格（trimStart 只去前导空格），以便标记 endsWithSpace 让英文单词间有空格
+			// 保留尾空格（trimStart 只去前导空格），以便标记 endsWithSpace
 			const text = match[1].trimStart();
 			if (!text) continue;
 
@@ -292,24 +292,7 @@ const parseEnhancedLrc = (lrc) => {
 	return lines;
 };
 
-// 判断两个相邻拉丁词之间是否需要插入空格（后端 ESLRC 不包含词间空格）
-// 注意：不仅支持纯 ASCII 英文，还支持带变音符号的拉丁字符（如越南语、法语、德语等），
-// 否则越南语等小语种单词会因变音符号（如 ạ/ẹ/ị/ọ/ụ/ỳ，位于 \u1E00-\u1EFF）不匹配而粘连。
-const shouldInsertSpace = (prev, next) => {
-	if (!prev || !next) return false;
-	// 中日韩文字之间不加空格
-	const CJKRegex = /([\p{Unified_Ideograph}|\u3040-\u309F|\u30A0-\u30FF])/gu;
-	if (prev.match(CJKRegex) || next.match(CJKRegex)) return false;
-	// 拉丁字母（含变音符号）：ASCII + Latin-1 补充 + 拉丁扩展 A/B + 拉丁扩展附加（越南语）
-	const latinLetter = 'A-Za-z\\u00C0-\\u024F\\u1E00-\\u1EFF';
-	// 前一个词以字母/数字/闭合标点结尾，后一个词以字母/数字/开放标点开头 → 加空格
-	// 注意：后一个词以撇号开头（如 're/'m/'s）表示缩写连读，不加空格
-	const prevEndsWord = new RegExp('[' + latinLetter + '0-9\'",.!?;:%>)\\]}]$').test(prev);
-	const nextStartsWord = new RegExp('^[' + latinLetter + '0-9("\\[{<`$#]').test(next);
-	return prevEndsWord && nextStartsWord;
-};
-
-// 后处理：标记 CJK 字符、空格结尾、英文词间自动补空格（与 liblyric 的 processLyric 逻辑一致）
+// 后处理：标记 CJK 字符和空格结尾（供 lyrics.js 渲染层使用）
 const postProcessDynamicLyric = (lines) => {
 	const CJKRegex = /([\p{Unified_Ideograph}|\u3040-\u309F|\u30A0-\u30FF])/gu;
 	for (const line of lines) {
@@ -317,14 +300,6 @@ const postProcessDynamicLyric = (lines) => {
 		for (let i = 0; i < dynamic.length; i++) {
 			const word = dynamic[i];
 			if (word?.word?.match(CJKRegex)) word.isCJK = true;
-			// 英文单词之间自动补空格：直接把空格写入词文本（供其他插件使用），
-			// 同时保留 endsWithSpace 标记（本插件渲染用）
-			if (i < dynamic.length - 1) {
-				const next = dynamic[i + 1];
-				if (shouldInsertSpace(word.word, next.word)) {
-					word.word += ' ';
-				}
-			}
 			if (word?.word?.match(/\s$/)) word.endsWithSpace = true;
 		}
 	}
@@ -615,7 +590,7 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 		console.warn('[AI Lyric] 后端返回的逐字歌词为空');
 		return null;
 	}
-	enhancedLines.forEach((l) => postProcessDynamicLyric([l]));
+	postProcessDynamicLyric(enhancedLines);
 
 	// 调试：输出后端返回的原始 LRC（由设置中的"AI 逐字歌词调试输出"开关控制）
 	if (getSetting('ai-lyric-debug', false)) {
