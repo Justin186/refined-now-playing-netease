@@ -479,9 +479,6 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	const current = getCurrentAudio() ?? {};
 	const currentAudio = current.audio ?? audio;
 	const currentLocalPath = current.localPath ?? localPath;
-	// 若重新获取后 src 与等待前不同，说明确实发生了切歌，用新 src 覆盖
-	const effectiveAudio = currentAudio;
-	const effectiveLocalPath = currentLocalPath;
 
 	// 3.6 切歌检测：等待元数据期间用户可能已切到下一首。
 	//     此时当前音频/歌曲信息已属于新歌，但本函数闭包里的 lyrics 仍是旧歌的，
@@ -497,69 +494,87 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	//    本地歌曲：audio.src 是 orpheus:// 等自定义协议，fetch 无法访问（Failed to fetch），
 	//              需从 LibFrontendPlay 的 info.url 解析本地路径，用 betterncm.fs.readFile 读取完整文件。
 	//    缓存：同一首歌（相同 src/localPath）重复播放时直接复用，避免重复下载浪费流量。
-	const cacheKey = getAudioCacheKey(effectiveAudio, effectiveLocalPath);
-	let audioBlob = getCachedAudioBlob(cacheKey);
-	let downloadOk = !!audioBlob;
-	if (downloadOk) {
-		console.log('[AI Lyric] 命中音频缓存，跳过下载');
-	}
-	for (let attempt = 0; attempt < 3 && !downloadOk; attempt++) {
-		try {
-			if (effectiveLocalPath) {
-				// 本地文件：用 betterncm.fs.readFile 读取完整 Blob
-				if (!betterncm?.fs?.readFile) {
-					throw new Error('betterncm.fs.readFile 不可用');
-				}
-				audioBlob = await betterncm.fs.readFile(effectiveLocalPath);
-				if (!audioBlob || audioBlob.size < 1024) {
-					throw new Error(`本地音频数据过小 (${audioBlob?.size ?? 0} bytes)，可能不完整`);
-				}
-			} else {
-				// 在线歌曲：fetch 下载完整文件
-				// 关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
-				// 可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
-				// 因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
-				const res = await fetch(effectiveAudio.src, { cache: 'no-store' });
-				if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
-				// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
-				if (res.status === 206) {
-					throw new Error('音频下载返回部分内容 (206)，可能不完整');
-				}
-				const blob = await res.blob();
-				// 用 Content-Length 校验完整性：实际大小与声明大小不一致说明下载被截断
-				const contentLength = Number(res.headers.get('Content-Length'));
-				if (contentLength > 0 && blob.size !== contentLength) {
-					throw new Error(`音频数据不完整 (${blob.size}/${contentLength} bytes)`);
-				}
-				// 简单完整性检查：blob 太小可能是不完整数据
-				if (blob.size < 1024) {
-					throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
-				}
-				audioBlob = blob;
+	//
+	//    注意：每次重试前都重新 getCurrentAudio()，防止 LibFrontendPlay 在下载期间
+	//    切歌创建了新 <audio> 元素，导致旧元素的 src 指向上一首歌的 CDN 地址。
+	const downloadWithRetry = async () => {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			// 每次尝试前重新获取当前音频（切歌时 LibFrontendPlay 会创建新 <audio> 元素）
+			const fresh = getCurrentAudio() ?? {};
+			const freshAudio = fresh.audio ?? currentAudio;
+			const freshLocalPath = fresh.localPath ?? currentLocalPath;
+
+			// 每次重试前校验是否切歌
+			if (!isSongStillCurrent(expectedSongId, expectedSrc)) {
+				console.log('[AI Lyric] 获取音频期间检测到切歌，中止本次 AI 处理');
+				return { aborted: true };
 			}
-			// 下载/读取成功，写入缓存
-			cacheAudioBlob(cacheKey, audioBlob);
-			downloadOk = true;
-		} catch (e) {
-			console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
-			if (attempt < 2) {
-				// 等待后重试
-				await new Promise((r) => setTimeout(r, 1500));
-				await waitForAudioMetadata(effectiveAudio, 5000);
+
+			const cacheKey = getAudioCacheKey(freshAudio, freshLocalPath);
+			let audioBlob = getCachedAudioBlob(cacheKey);
+			if (audioBlob) {
+				console.log('[AI Lyric] 命中音频缓存，跳过下载');
+				return { audioBlob, cacheKey, audio: freshAudio, localPath: freshLocalPath };
+			}
+
+			try {
+				if (freshLocalPath) {
+					// 本地文件：用 betterncm.fs.readFile 读取完整 Blob
+					if (!betterncm?.fs?.readFile) {
+						throw new Error('betterncm.fs.readFile 不可用');
+					}
+					audioBlob = await betterncm.fs.readFile(freshLocalPath);
+					if (!audioBlob || audioBlob.size < 1024) {
+						throw new Error(`本地音频数据过小 (${audioBlob?.size ?? 0} bytes)，可能不完整`);
+					}
+				} else {
+					// 在线歌曲：fetch 下载完整文件
+					// 关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
+					// 可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
+					// 因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
+					const res = await fetch(freshAudio.src, { cache: 'no-store' });
+					if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
+					// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
+					if (res.status === 206) {
+						throw new Error('音频下载返回部分内容 (206)，可能不完整');
+					}
+					const blob = await res.blob();
+					// 用 Content-Length 校验完整性：实际大小与声明大小不一致说明下载被截断
+					const contentLength = Number(res.headers.get('Content-Length'));
+					if (contentLength > 0 && blob.size !== contentLength) {
+						throw new Error(`音频数据不完整 (${blob.size}/${contentLength} bytes)`);
+					}
+					// 简单完整性检查：blob 太小可能是不完整数据
+					if (blob.size < 1024) {
+						throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
+					}
+					audioBlob = blob;
+				}
+				// 下载/读取成功，写入缓存
+				cacheAudioBlob(cacheKey, audioBlob);
+				return { audioBlob, cacheKey, audio: freshAudio, localPath: freshLocalPath };
+			} catch (e) {
+				console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
+				if (attempt < 2) {
+					await new Promise((r) => setTimeout(r, 1500));
+					await waitForAudioMetadata(freshAudio, 5000);
+				}
 			}
 		}
-	}
-	if (!downloadOk) {
+		return { audioBlob: null };
+	};
+
+	const downloadResult = await downloadWithRetry();
+	if (downloadResult.aborted) return null;
+	if (!downloadResult.audioBlob) {
 		console.warn('[AI Lyric] 多次获取音频失败，跳过 AI 处理');
 		return null;
 	}
-
-	// 4.5 下载/读取音频期间用户可能又切了歌，发送前再校验一次，
-	//     确保发给后端的音频与歌词文本属于同一首歌。
-	if (!isSongStillCurrent(expectedSongId, expectedSrc)) {
-		console.log('[AI Lyric] 下载音频期间检测到切歌，中止本次 AI 处理');
-		return null;
-	}
+	const audioBlob = downloadResult.audioBlob;
+	const cacheKey = downloadResult.cacheKey;
+	// 使用下载时最新获取的 audio/localPath（切歌时可能已更新）
+	const effectiveAudio = downloadResult.audio;
+	const effectiveLocalPath = downloadResult.localPath;
 
 	// 5. 请求后端，同时获取标准 LRC 和逐字 LRC（带重试）
 	//    本地文件用其扩展名作为音频文件名，便于后端识别格式
