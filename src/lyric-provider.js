@@ -156,7 +156,7 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 			// AI 逐字歌词处理：从 LibFrontendPlay 获取音频，连同歌词文本发送到本地后端，
 			// 用返回的逐字歌词替换 dynamicLyric。失败时保留原歌词。
 			// 仅在设置中启用时才处理（关闭时不探测端口、不下载音频）
-			const aiLyrics = getSetting('ai-lyric', false) ? await applyAILyric(processedLyrics, expectedSongId, expectedSrc) : null;
+			const aiLyrics = getSetting('ai-lyric', true) ? await applyAILyric(processedLyrics, expectedSongId, expectedSrc) : null;
 			if (aiLyrics) {
 				processedLyrics = aiLyrics;
 			}

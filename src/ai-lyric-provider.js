@@ -489,7 +489,7 @@ const isSongStillCurrent = (expectedSongId, expectedSrc) => {
 // expectedSongId/expectedSrc：用于在异步处理期间检测切歌，若已切歌则中止
 export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	// 0. 设置中未启用 AI 逐字歌词时直接跳过（不探测端口、不下载音频）
-	if (!getSetting('ai-lyric', false)) {
+	if (!getSetting('ai-lyric', true)) {
 		return null;
 	}
 
