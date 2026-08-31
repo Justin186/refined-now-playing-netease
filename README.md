@@ -1,27 +1,50 @@
-# Refined Now Playing
+# Refined Now Playing + AI 逐字歌词
 
-一个美化网易云音乐播放界面的 [BetterNCM](https://github.com/MicroCBer/BetterNCM) 插件
+本项目基于 [solstice23/refined-now-playing-netease](https://github.com/solstice23/refined-now-playing-netease) 进行二次开发，在原版精美的沉浸式播放界面与歌词动画基础上，新增了 AI 逐字歌词对齐功能。
 
-# Status
+本插件集成了本地 AI 逐字歌词对齐功能：从 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay) 获取当前播放音频，连同歌词文本发送到本地 LRC-Maker AI 后端，用返回的逐字歌词替换 `dynamicLyric`，并通过 `lyrics-updated` 事件提供给其他插件（如LyricBar）。
 
-Since I no longer use CloudMusic, the maintenance of this project has been suspended indefinitely.
+> 感谢 [solstice23](https://github.com/solstice23) 制作了原版插件并开源，为本项目提供了坚实的基础。如果你喜欢本项目，也请去给原仓库一个 ⭐ Star 支持一下！
 
-# 安装
+## 效果
 
-0. 安装 [BetterNCM](https://github.com/MicroCBer/BetterNCM) 插件
-1. 在插件商店中安装
+（视频中的逐字时间戳均由AI处理得到）
 
-# 效果
+https://github.com/user-attachments/assets/e2568e3d-8390-4682-9798-f8e0d5b24755
 
-https://user-images.githubusercontent.com/23134847/216518149-9d85c6a6-4ad5-4c2c-9843-a2f65f610fd0.mp4
+## 使用前提
 
-![screenshot1](screenshot1.jpg)
+1. 已安装并启用 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay) 插件
+2. 本地已启动 [LRC-Maker AI 后端](https://github.com/Justin186/LRCMaker-AI-Backend)（默认监听 `127.0.0.1:8000`，端口探测范围 8000~8009）
 
-![screenshot2](screenshot3.jpg)
+## 启用
 
-![screenshot3](screenshot2.jpg)
+1. 打开网易云音乐 → 进入CD页 → 右上角设置 → 歌词 → 勾选「AI 逐字歌词」
+2. 切换歌曲触发歌词处理
 
-![screenshot4](screenshot4.jpg)
+> 该选项默认关闭。关闭时不会探测本地端口、不会下载音频。
+
+## 调试
+
+按 `F12` 打开开发者工具，Console 中会输出 `[AI Lyric]` 前缀的日志：
+
+- `[AI Lyric] 探测到后端端口: 8000` — 端口探测成功
+- `[AI Lyric] standard_lrc:` / `[AI Lyric] enhanced_lrc:` — 后端返回的原始 LRC（由「AI 逐字歌词调试输出」开关控制，见下）
+- `[AI Lyric] 原始歌词:` — 处理前的歌词行（时间 + 文本）
+- `[AI Lyric] 合并后歌词:` — 合并后的歌词行（时间 + 文本 + 是否有逐字 + 逐字拼接文本）
+- `[AI Lyric] 已应用 AI 逐字歌词` — 处理成功
+
+### 调试输出开关
+
+设置 → 杂项 → 勾选「AI 逐字歌词调试输出」后，会在 Console 中额外输出后端返回的原始 LRC（`standard_lrc` / `enhanced_lrc`），便于排查后端对齐结果。默认关闭。
+
+如果 Console 中完全没有 `[AI Lyric]` 输出，请检查：
+
+1. 是否已在设置中勾选「AI 逐字歌词」（该开关默认关闭）
+2. 是否已重启网易云音乐（让新代码生效）
+3. 是否切换了歌曲（歌词处理在切歌时触发）
+4. Console 顶部的过滤条件是否误设为只显示错误/警告
+5. 是否有使用日志拦截插件
 
 # 开发与部署
 
@@ -91,17 +114,17 @@ $srcMain = ".\dist\main.js"
 $srcManifest = ".\dist\manifest.json"
 
 # 重新打包 .plugin（ZIP，main.js + manifest.json 在根目录）
-if (Test-Path $dest) { Remove-Item $dest -Force }
-$zip = [System.IO.Compression.ZipFile]::Open($dest, 'Create')
-$entryMain = $zip.CreateEntry('main.js')
-$stream = $entryMain.Open()
-$bytes = [System.IO.File]::ReadAllBytes($srcMain)
-$stream.Write($bytes, 0, $bytes.Length)
+if (Test-Path dest) { Remove-Itemdest) { Remove-Item dest -Force }
+zip=[System.IO.Compression.ZipFile]::Open(zip = [System.IO.Compression.ZipFile]::Open(dest, 'Create')
+entryMain=entryMain = zip.CreateEntry('main.js')
+stream=stream = entryMain.Open()
+bytes=[System.IO.File]::ReadAllBytes(bytes = [System.IO.File]::ReadAllBytes(srcMain)
+stream.Write(stream.Write(bytes, 0, $bytes.Length)
 $stream.Dispose()
-$entryManifest = $zip.CreateEntry('manifest.json')
-$stream = $entryManifest.Open()
-$bytes = [System.IO.File]::ReadAllBytes($srcManifest)
-$stream.Write($bytes, 0, $bytes.Length)
+entryManifest=entryManifest = zip.CreateEntry('manifest.json')
+stream=stream = entryManifest.Open()
+bytes=[System.IO.File]::ReadAllBytes(bytes = [System.IO.File]::ReadAllBytes(srcManifest)
+stream.Write(stream.Write(bytes, 0, $bytes.Length)
 $stream.Dispose()
 $zip.Dispose()
 
@@ -117,36 +140,3 @@ Write-Host "部署完成，请重启网易云音乐"
 1. 完全退出网易云音乐（托盘图标右键 → 退出）
 2. 重新打开网易云音乐
 3. 按 `F12` 打开开发者工具，在 Console 中应能看到插件日志
-
-# AI 逐字歌词（实验性功能）
-
-本插件集成了本地 AI 逐字歌词对齐功能：从 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay) 获取当前播放音频，连同歌词文本发送到本地 LRC-Maker AI 后端，用返回的逐字歌词替换 `dynamicLyric`，并通过 `lyrics-updated` 事件提供给其他插件。
-
-## 使用前提
-
-1. 已安装并启用 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay) 插件
-2. 本地已启动 LRC-Maker AI 后端（默认监听 `127.0.0.1:8000`，端口探测范围 8000~8009）
-
-## 启用
-
-1. 打开网易云音乐 → 设置 → 歌词 → 勾选「AI 逐字歌词」
-2. 切换歌曲触发歌词处理
-
-> 默认关闭。关闭时不会探测本地端口、不会下载音频。
-
-## 调试
-
-按 `F12` 打开开发者工具，Console 中会输出 `[AI Lyric]` 前缀的日志：
-
-- `[AI Lyric] 探测到后端端口: 8000` — 端口探测成功
-- `[AI Lyric] standard_lrc:` / `[AI Lyric] enhanced_lrc:` — 后端返回的原始 LRC
-- `[AI Lyric] 原始歌词:` — 处理前的歌词行（时间 + 文本）
-- `[AI Lyric] 合并后歌词:` — 合并后的歌词行（时间 + 文本 + 是否有逐字 + 逐字拼接文本）
-- `[AI Lyric] 已应用 AI 逐字歌词` — 处理成功
-
-如果 Console 中完全没有 `[AI Lyric]` 输出，请检查：
-
-1. 是否已在设置中勾选「AI 逐字歌词」（该开关默认关闭）
-2. 是否已重启网易云音乐（让新代码生效）
-3. 是否切换了歌曲（歌词处理在切歌时触发）
-4. Console 顶部的过滤条件是否误设为只显示错误/警告
