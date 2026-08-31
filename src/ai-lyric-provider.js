@@ -414,12 +414,23 @@ export async function applyAILyric(lyrics) {
 	// 3. 只等音频元数据就绪（确保 src 已切换到新歌），不等待缓冲完整
 	await waitForAudioMetadata(audio);
 
+	// 3.5 重新获取当前音频，确保 src/localPath 已切换到新歌。
+	//     切歌瞬间触发本函数时，步骤 2 拿到的 audio.src 可能还是上一首歌的 URL，
+	//     若直接用旧 src 计算缓存 key，会命中上一首歌的音频缓存，把旧歌音频发给后端。
+	//     等待元数据就绪后 audio.src 已更新为新歌，此时重新读取才能拿到正确的缓存 key。
+	const current = getCurrentAudio() ?? {};
+	const currentAudio = current.audio ?? audio;
+	const currentLocalPath = current.localPath ?? localPath;
+	// 若重新获取后 src 与等待前不同，说明确实发生了切歌，用新 src 覆盖
+	const effectiveAudio = currentAudio;
+	const effectiveLocalPath = currentLocalPath;
+
 	// 4. 获取完整音频 blob（带重试 + 内存缓存）
 	//    在线歌曲：audio.src 是 http(s) CDN 地址，用 fetch 下载。
 	//    本地歌曲：audio.src 是 orpheus:// 等自定义协议，fetch 无法访问（Failed to fetch），
 	//              需从 LibFrontendPlay 的 info.url 解析本地路径，用 betterncm.fs.readFile 读取完整文件。
 	//    缓存：同一首歌（相同 src/localPath）重复播放时直接复用，避免重复下载浪费流量。
-	const cacheKey = getAudioCacheKey(audio, localPath);
+	const cacheKey = getAudioCacheKey(effectiveAudio, effectiveLocalPath);
 	let audioBlob = getCachedAudioBlob(cacheKey);
 	let downloadOk = !!audioBlob;
 	if (downloadOk) {
@@ -427,12 +438,12 @@ export async function applyAILyric(lyrics) {
 	}
 	for (let attempt = 0; attempt < 3 && !downloadOk; attempt++) {
 		try {
-			if (localPath) {
+			if (effectiveLocalPath) {
 				// 本地文件：用 betterncm.fs.readFile 读取完整 Blob
 				if (!betterncm?.fs?.readFile) {
 					throw new Error('betterncm.fs.readFile 不可用');
 				}
-				audioBlob = await betterncm.fs.readFile(localPath);
+				audioBlob = await betterncm.fs.readFile(effectiveLocalPath);
 				if (!audioBlob || audioBlob.size < 1024) {
 					throw new Error(`本地音频数据过小 (${audioBlob?.size ?? 0} bytes)，可能不完整`);
 				}
@@ -441,7 +452,7 @@ export async function applyAILyric(lyrics) {
 				// 关键：LibFrontendPlay 的 audio 元素用 Range 请求流式加载，浏览器 HTTP 缓存里
 				// 可能存有 206 部分内容。fetch 默认会复用该缓存导致只拿到部分音频，
 				// 因此必须 cache: 'no-store' 强制重新下载完整文件，并校验状态码与 Content-Length。
-				const res = await fetch(audio.src, { cache: 'no-store' });
+				const res = await fetch(effectiveAudio.src, { cache: 'no-store' });
 				if (!res.ok) throw new Error(`音频下载失败: ${res.status}`);
 				// 206 表示只返回了部分内容（复用了 audio 元素的 Range 缓存），视为不完整
 				if (res.status === 206) {
@@ -467,7 +478,7 @@ export async function applyAILyric(lyrics) {
 			if (attempt < 2) {
 				// 等待后重试
 				await new Promise((r) => setTimeout(r, 1500));
-				await waitForAudioMetadata(audio, 5000);
+				await waitForAudioMetadata(effectiveAudio, 5000);
 			}
 		}
 	}
@@ -478,7 +489,7 @@ export async function applyAILyric(lyrics) {
 
 	// 5. 请求后端，同时获取标准 LRC 和逐字 LRC（带重试）
 	//    本地文件用其扩展名作为音频文件名，便于后端识别格式
-	const extMatch = localPath ? localPath.match(/\.(\w+)$/) : null;
+	const extMatch = effectiveLocalPath ? effectiveLocalPath.match(/\.(\w+)$/) : null;
 	const audioFileName = extMatch ? `audio.${extMatch[1]}` : 'audio.bin';
 	let result;
 	let requestOk = false;
