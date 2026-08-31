@@ -3,7 +3,7 @@
 
 import { parseLyric } from './liblyric/index.ts'
 import { cyrb53, getSetting } from './utils.js'
-import { applyAILyric, isMetadataLine } from './ai-lyric-provider.js'
+import { applyAILyric, getCurrentAudio, isMetadataLine } from './ai-lyric-provider.js'
 
 const preProcessLyrics = (lyrics) => {
 	if (!lyrics) return null;
@@ -136,13 +136,27 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 	if ((rawLyrics?.lrc?.lyric ?? '') != currentRawLRC) {
 		currentRawLRC = (rawLyrics?.lrc?.lyric ?? '') ;
 		const preprocessedLyrics = preProcessLyrics(rawLyrics);
+
+		// 在异步处理开始前，同步捕获当前歌曲身份（songID + 音频 src/localPath）。
+		// 切歌瞬间触发本回调时，audio.src 可能还是上一首的 URL，因此这里捕获的是
+		// "触发本歌词处理时"的歌曲身份，用于在 applyAILyric 的异步处理期间检测切歌，
+		// 避免把"上一首的歌词文本 + 当前播放的音频"错配发给后端。
+		let expectedSongId = songID;
+		let expectedSrc = null;
+		try {
+			const cur = getCurrentAudio?.() ?? null;
+			expectedSrc = cur?.localPath || cur?.audio?.src || null;
+		} catch (e) {
+			// 忽略，expectedSrc 保持 null（此时仅靠 songID 校验）
+		}
+
 		setTimeout(async () => {
 			let processedLyrics = await processLyrics(preprocessedLyrics);
 
 			// AI 逐字歌词处理：从 LibFrontendPlay 获取音频，连同歌词文本发送到本地后端，
 			// 用返回的逐字歌词替换 dynamicLyric。失败时保留原歌词。
 			// 仅在设置中启用时才处理（关闭时不探测端口、不下载音频）
-			const aiLyrics = getSetting('ai-lyric', false) ? await applyAILyric(processedLyrics) : null;
+			const aiLyrics = getSetting('ai-lyric', false) ? await applyAILyric(processedLyrics, expectedSongId, expectedSrc) : null;
 			if (aiLyrics) {
 				processedLyrics = aiLyrics;
 			}

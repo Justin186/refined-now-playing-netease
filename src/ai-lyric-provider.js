@@ -39,7 +39,7 @@ const getCachedAudioBlob = (key) => (key ? audioBlobCache.get(key) : null);
 // 返回 { audio, localPath }：
 //   - audio: 当前播放的 <audio> 元素
 //   - localPath: 若为本地文件则返回原始路径（用于 betterncm.fs.readFile），否则为 null
-const getCurrentAudio = () => {
+export const getCurrentAudio = () => {
 	try {
 		const plugin = window.loadedPlugins?.['LibFrontendPlay'];
 		if (!plugin || !plugin.enabled) return null;
@@ -389,9 +389,41 @@ const getSongInfo = () => {
 	}
 };
 
+// 判断当前播放的歌曲是否仍与期望的歌曲一致。
+// 用于在异步 AI 处理期间检测用户是否已切歌：若已切歌则中止本次处理，
+// 避免把"上一首的歌词文本 + 当前播放的音频"错配发给后端。
+// expectedSongId: onProcessLyrics 回调传入的 songID（可能为 undefined）
+// expectedSrc:    触发处理时捕获的 audio.src / localPath
+const isSongStillCurrent = (expectedSongId, expectedSrc) => {
+	try {
+		// 1) 优先用 songID 校验（网易云切歌时 id 会变化）
+		if (expectedSongId != null) {
+			const playingId = betterncm?.ncm?.getPlaying?.()?.id;
+			// songID 可用且能取到当前 id 时，以 songID 为准（同一首歌 src 可能变化，不据此误判）
+			if (playingId != null) {
+				return String(playingId) === String(expectedSongId);
+			}
+			// songID 可用但取不到当前 id 时，退回用 src 校验
+		}
+		// 2) 用音频 src/localPath 校验（songID 不可用或取不到当前 id 时兜底）
+		if (expectedSrc) {
+			const cur = getCurrentAudio() ?? {};
+			const curSrc = cur.localPath || cur.audio?.src || null;
+			if (curSrc && curSrc !== expectedSrc) {
+				return false;
+			}
+		}
+		return true;
+	} catch (e) {
+		// 校验失败时保守起见放行（不阻塞正常流程）
+		return true;
+	}
+};
+
 // 把后端返回的逐字歌词应用到现有歌词行上
 // 返回新的歌词数组（替换了 dynamicLyric），失败时返回 null
-export async function applyAILyric(lyrics) {
+// expectedSongId/expectedSrc：用于在异步处理期间检测切歌，若已切歌则中止
+export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	// 0. 设置中未启用 AI 逐字歌词时直接跳过（不探测端口、不下载音频）
 	if (!getSetting('ai-lyric', false)) {
 		return null;
@@ -424,6 +456,15 @@ export async function applyAILyric(lyrics) {
 	// 若重新获取后 src 与等待前不同，说明确实发生了切歌，用新 src 覆盖
 	const effectiveAudio = currentAudio;
 	const effectiveLocalPath = currentLocalPath;
+
+	// 3.6 切歌检测：等待元数据期间用户可能已切到下一首。
+	//     此时当前音频/歌曲信息已属于新歌，但本函数闭包里的 lyrics 仍是旧歌的，
+	//     若继续会把"旧歌词 + 新音频"错配发给后端。检测到切歌则直接中止，
+	//     新歌自己的 onProcessLyrics 会触发新的 AI 处理。
+	if (!isSongStillCurrent(expectedSongId, expectedSrc)) {
+		console.log('[AI Lyric] 处理期间检测到切歌，中止本次 AI 处理');
+		return null;
+	}
 
 	// 4. 获取完整音频 blob（带重试 + 内存缓存）
 	//    在线歌曲：audio.src 是 http(s) CDN 地址，用 fetch 下载。
@@ -484,6 +525,13 @@ export async function applyAILyric(lyrics) {
 	}
 	if (!downloadOk) {
 		console.warn('[AI Lyric] 多次获取音频失败，跳过 AI 处理');
+		return null;
+	}
+
+	// 4.5 下载/读取音频期间用户可能又切了歌，发送前再校验一次，
+	//     确保发给后端的音频与歌词文本属于同一首歌。
+	if (!isSongStillCurrent(expectedSongId, expectedSrc)) {
+		console.log('[AI Lyric] 下载音频期间检测到切歌，中止本次 AI 处理');
 		return null;
 	}
 
