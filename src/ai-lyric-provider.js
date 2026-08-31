@@ -35,6 +35,44 @@ const cacheAudioBlob = (key, blob) => {
 // 读取缓存
 const getCachedAudioBlob = (key) => (key ? audioBlobCache.get(key) : null);
 
+// 用 AudioContext 解码音频 blob，返回其时长（秒）。失败返回 null。
+// 用于校验下载的音频与当前播放歌曲是否一致（时长应大致匹配）。
+const getAudioBlobDuration = async (blob) => {
+	try {
+		const AudioCtx = window.AudioContext || window.webkitAudioContext;
+		if (!AudioCtx) return null;
+		const ctx = new AudioCtx();
+		try {
+			const arrayBuffer = await blob.arrayBuffer();
+			const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+			return audioBuffer.duration;
+		} finally {
+			// 及时关闭 AudioContext，避免资源泄漏
+			try { ctx.close(); } catch (e) { /* 忽略 */ }
+		}
+	} catch (e) {
+		console.warn('[AI Lyric] 解码音频时长失败', e);
+		return null;
+	}
+};
+
+// 校验下载的音频 blob 时长是否与当前播放歌曲一致。
+// 若时长明显不符（差异 > 5 秒），说明下载到了错误的歌曲（切歌竞态），返回 false。
+// 时长无法获取（解码失败/无 duration）时保守放行，不阻塞正常流程。
+const isBlobDurationMatching = async (blob, audio) => {
+	const expected = audio?.duration;
+	if (!expected || !isFinite(expected) || expected <= 0) return true; // 无参考时长，放行
+	const actual = await getAudioBlobDuration(blob);
+	if (actual == null || !isFinite(actual) || actual <= 0) return true; // 无法解码，放行
+	// 允许 5 秒误差（不同编码/截断可能略有差异）
+	const diff = Math.abs(actual - expected);
+	if (diff > 5) {
+		console.warn(`[AI Lyric] 音频时长不匹配，疑似下载到错误歌曲：blob=${actual.toFixed(1)}s，当前播放=${expected.toFixed(1)}s`);
+		return false;
+	}
+	return true;
+};
+
 // 从 LibFrontendPlay 获取当前播放的 <audio> 元素及本地文件路径（若有）
 // 返回 { audio, localPath }：
 //   - audio: 当前播放的 <audio> 元素
@@ -513,8 +551,16 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 			const cacheKey = getAudioCacheKey(freshAudio, freshLocalPath);
 			let audioBlob = getCachedAudioBlob(cacheKey);
 			if (audioBlob) {
-				console.log('[AI Lyric] 命中音频缓存，跳过下载');
-				return { audioBlob, cacheKey, audio: freshAudio, localPath: freshLocalPath };
+				// 缓存命中：仍需时长校验，防止缓存里存的是旧歌的 blob
+				// （切歌时 LibFrontendPlay 可能复用同一 <audio> 元素，src 未变导致 key 命中旧缓存）。
+				if (!(await isBlobDurationMatching(audioBlob, freshAudio))) {
+					console.warn('[AI Lyric] 缓存音频时长与当前播放歌曲不符，丢弃缓存并重新下载');
+					audioBlobCache.delete(cacheKey);
+					audioBlob = null;
+				} else {
+					console.log('[AI Lyric] 命中音频缓存，跳过下载');
+					return { audioBlob, cacheKey, audio: freshAudio, localPath: freshLocalPath };
+				}
 			}
 
 			try {
@@ -549,6 +595,11 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 						throw new Error(`音频数据过小 (${blob.size} bytes)，可能不完整`);
 					}
 					audioBlob = blob;
+				}
+				// 时长校验：确认下载的音频与当前播放歌曲一致（防止切歌竞态下载到旧歌）。
+				// 若时长明显不符则视为下载到错误歌曲，抛出异常触发重试（重新获取当前 audio）。
+				if (!(await isBlobDurationMatching(audioBlob, freshAudio))) {
+					throw new Error('音频时长与当前播放歌曲不符，疑似下载到旧歌');
 				}
 				// 下载/读取成功，写入缓存
 				cacheAudioBlob(cacheKey, audioBlob);
