@@ -69,28 +69,79 @@ export const getCurrentAudio = () => {
 // 等待音频元数据就绪（duration 可用），确保 audio.src 已切换到新歌且可下载。
 // 注意：这里只等元数据，不等待缓冲完整——因为完整音频由后续 fetch 直接下载，
 // 下载完成即代表完整，无需依赖 audio 元素缓慢的流式缓冲（那会白白等几十秒）。
+// 
+// 处理策略：
+//   1. 快速路径：若传入的 audio 元素已就绪则直接返回。
+//   2. 事件监听：在传入的 audio 上监听 loadedmetadata。
+//   3. 轮询兜底：定期重新获取 getCurrentAudio()，防止 LibFrontendPlay 切歌时
+//      创建了新的 <audio> 元素导致旧元素永远不会触发 loadedmetadata。
 const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
 	// 元数据已就绪（duration 可用）则直接返回
 	if (audio.readyState >= 1 && audio.duration > 0) return true;
 
 	return new Promise((resolve) => {
+		let resolved = false;
 		const timeout = setTimeout(() => {
-			cleanup();
+			if (resolved) return;
+			resolved = true;
+			cleanupAll();
 			console.warn('[AI Lyric] 等待音频元数据超时，尝试直接下载');
 			resolve(false);
 		}, timeoutMs);
 
-		const onLoaded = () => {
-			cleanup();
+		const resolveOnce = () => {
+			if (resolved) return;
+			resolved = true;
+			cleanupAll();
 			resolve(true);
 		};
 
-		const cleanup = () => {
-			clearTimeout(timeout);
-			audio.removeEventListener('loadedmetadata', onLoaded);
-		};
-
+		// 监听传入 audio 的 loadedmetadata（快速路径）
+		const onLoaded = () => resolveOnce();
 		audio.addEventListener('loadedmetadata', onLoaded);
+
+		// 竞态保护：本地文件加载极快，loadedmetadata 可能在添加监听前已触发
+		if (audio.readyState >= 1 && audio.duration > 0) {
+			resolveOnce();
+			return;
+		}
+
+		// 轮询兜底：每 500ms 重新获取 getCurrentAudio()，
+		// 处理 LibFrontendPlay 切歌时重建 <audio> 元素的情况。
+		// 当新 audio 元素就绪时，同时为其添加事件监听和检查 readyState。
+		let pollTimer = null;
+		const seenAudios = new Set([audio]); // 已监听过的 audio 元素，避免重复添加监听
+
+		const poll = () => {
+			if (resolved) return;
+			try {
+				const current = getCurrentAudio();
+				const cur = current?.audio;
+				if (cur && !seenAudios.has(cur)) {
+					seenAudios.add(cur);
+					cur.addEventListener('loadedmetadata', onLoaded);
+					if (cur.readyState >= 1 && cur.duration > 0) {
+						resolveOnce();
+						return;
+					}
+				}
+			} catch (e) {
+				// 忽略轮询中的异常
+			}
+			if (!resolved) {
+				pollTimer = setTimeout(poll, 500);
+			}
+		};
+		pollTimer = setTimeout(poll, 500);
+
+		const cleanupAll = () => {
+			clearTimeout(timeout);
+			clearTimeout(pollTimer);
+			// 移除所有已添加的事件监听
+			seenAudios.forEach((el) => {
+				el.removeEventListener('loadedmetadata', onLoaded);
+			});
+		};
 	});
 };
 
