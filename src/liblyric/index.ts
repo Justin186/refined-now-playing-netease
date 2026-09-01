@@ -117,14 +117,17 @@ export function parseLyric(
 			...(v.unsynced ? { unsynced: true } : {}),
 		}));
 
-		parsePureLyric(translated).forEach((line) => {
+		const translatedLines = parsePureLyric(translated);
+		const romanLines = parsePureLyric(roman);
+
+		translatedLines.forEach((line) => {
 			const target = result.find((v) => v.time === line.time);
 			if (target) {
 				target.translatedLyric = line.lyric;
 			}
 		});
 
-		parsePureLyric(roman).forEach((line) => {
+		romanLines.forEach((line) => {
 			const target = result.find((v) => v.time === line.time);
 			if (target) {
 				target.romanLyric = line.lyric;
@@ -162,54 +165,42 @@ export function parseLyric(
 			}
 
 			//console.log(JSON.parse(JSON.stringify(originalLyrics)), JSON.parse(JSON.stringify(lyric)));
-			originalLyrics.forEach((line) => {
-				//let target = findLast(lyric, (v) => v.time === line.time);
-				let target: LyricPureLine | null = null;
-				if (attachMatchingMode === 'equal') {
-					//target = findLast(lyric, (v) => v.time === line.time);
-					target = findLast(lyric, (v) => Math.abs(v.time - line.time) < 20)
-				} else {
-					lyric.forEach((v) => {
-						if (target) {
-							if (
-								Math.abs(target.time - line.time) > Math.abs(v.time - line.time)
-							) {
-								target = v;
-							}
-						} else {
-							target = v;
+			if (attachMatchingMode === 'closest') {
+				// 'closest' 模式：从翻译/罗马音行的角度出发，为每一行找到时间最近的原文行并附加原文文本。
+				// 原实现从原文行角度出发，当翻译与原文时间戳差异 >1s 时阈值过滤掉所有匹配，
+				// 导致翻译行没有原文文本 → 后续 attachLyricToDynamic 相似度匹配失败（空串 vs 短串 → 元数据行"胜出"）。
+				lyric.forEach((line) => {
+					let closestOriginal: LyricPureLine | null = null;
+					let minDiff = Infinity;
+					originalLyrics.forEach((orig) => {
+						const diff = Math.abs(orig.time - line.time);
+						if (diff < minDiff) {
+							minDiff = diff;
+							closestOriginal = orig;
 						}
 					});
-					// 'closest' 模式下，若最近翻译行与原文行时间差过大（>1s），
-					// 说明该原文行没有对应翻译（如作词/作曲无翻译），不附加，
-					// 避免把不相关的原文行错误拼接到某个翻译行上导致相似度匹配错乱
-					if (target && Math.abs((target as LyricPureLine).time - line.time) > 1000) {
-						target = null;
-					}
-				}
-					
-				//console.log(line, target);
-				/*if (!target) {
-					lyric.forEach((v) => {
-						if (target) {
-							if (
-								Math.abs(target.time - line.time) > Math.abs(v.time - line.time)
-							) {
-								target = v;
-							}
-						} else {
-							target = v;
+					if (closestOriginal) {
+						line.originalLyric = line.originalLyric || "";
+						if (line.originalLyric.length > 0) {
+							line.originalLyric += " ";
 						}
-					});
-				}*/
-				if (target) {
-					target.originalLyric = target.originalLyric || "";
-					if (target.originalLyric.length > 0) {
-						target.originalLyric += " ";
+						const orig = closestOriginal as LyricPureLine;
+						line.originalLyric += orig.lyric;
 					}
-					target.originalLyric += line.lyric;
-				}
-			});
+				});
+			} else {
+				// 'equal' 模式：时间戳精确匹配（±20ms）
+				originalLyrics.forEach((line) => {
+					const target = findLast(lyric, (v) => Math.abs(v.time - line.time) < 20);
+					if (target) {
+						target.originalLyric = target.originalLyric || "";
+						if (target.originalLyric.length > 0) {
+							target.originalLyric += " ";
+						}
+						target.originalLyric += line.lyric;
+					}
+				});
+			}
 			//console.log(JSON.parse(JSON.stringify(originalLyrics)), JSON.parse(JSON.stringify(lyric)));
 			return lyric;
 		}
@@ -253,6 +244,8 @@ export function parseLyric(
 					}
 				}
 
+				// console.log(`[Lyric Debug] attachLyricToDynamic[${field}]: 翻译行"${line.lyric}" → 匹配到逐字行${targetIndex} "${processed[targetIndex].originalLyric}" (minWeight=${minWeight})`);
+
 				//console.log(targetIndex);
 				const target = processed[targetIndex];
 
@@ -273,7 +266,6 @@ export function parseLyric(
 		attachLyricToDynamic(translatedParsed, 'translatedLyric');
 		attachLyricToDynamic(romanParsed, 'romanLyric');
 		attachLyricToDynamic(rawParsed, 'rawLyric');
-
 
 		//console.log("processed", JSON.parse(JSON.stringify(processed)));
 
