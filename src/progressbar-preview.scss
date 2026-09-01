@@ -1,3 +1,5 @@
+@use "sass:math";
+
 .progressbar-preview {
 	position: fixed;
 	z-index: 1000;
@@ -29,8 +31,8 @@
 			&.current {
 				$fade-width: 20;
 				-webkit-mask-image: linear-gradient(to right,
-					rgba(0, 0, 0, 1) #{100 / (200 + $fade-width) * 100%},
-					rgba(0, 0, 0, 0.4) #{(100 + $fade-width) / (200 + $fade-width) * 100%}
+					rgba(0, 0, 0, 1) #{math.div(100, 200 + $fade-width) * 100%},
+					rgba(0, 0, 0, 0.4) #{math.div(100 + $fade-width, 200 + $fade-width) * 100%}
 				);
 				-webkit-mask-size: #{(200 + $fade-width) * 1%} 100%;
 				-webkit-mask-repeat: no-repeat;

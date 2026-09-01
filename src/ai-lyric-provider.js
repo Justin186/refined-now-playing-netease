@@ -619,7 +619,8 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	// 2. 获取当前音频及本地路径
 	const { audio, localPath } = getCurrentAudio() ?? {};
 	if (!audio) {
-		console.log('[AI Lyric] 未找到 LibFrontendPlay 音频，跳过 AI 处理');
+		// 未找到音频：开启网易云或尚未播放歌曲时，LibFrontendPlay 可能已加载但
+		// 还没有 currentAudioPlayer，此时正常跳过即可，无需打印日志。
 		return null;
 	}
 	// 计算期望歌曲时长（秒），用于等待音频元素切换到新歌
