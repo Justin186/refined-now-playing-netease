@@ -1,4 +1,10 @@
-import { findLast } from "lodash";
+// 从数组末尾向前查找第一个满足条件的元素（替代 lodash.findLast，避免 ESM/CJS 兼容问题）
+const findLast = <T>(arr: T[], predicate: (value: T) => boolean): T | undefined => {
+	for (let i = arr.length - 1; i >= 0; i--) {
+		if (predicate(arr[i])) return arr[i];
+	}
+	return undefined;
+};
 
 export interface DynamicLyricWord {
 	time: number;
@@ -110,12 +116,50 @@ export function parseLyric(
 	dynamic: string = "",
 ): LyricLine[] {
 	if (dynamic.trim().length === 0) {
-		const result: LyricLine[] = parsePureLyric(original).map((v) => ({
-			time: v.time,
-			originalLyric: v.lyric,
-			duration: 0,
-			...(v.unsynced ? { unsynced: true } : {}),
-		}));
+		const originalParsed = parsePureLyric(original);
+
+		// 双语 LRC 支持：当同一时间戳有多行时，第一行保留为原文，后续行视为翻译。
+		// 典型场景：用户手动编写的双语 LRC 文件将原文和翻译交错放在同一时间戳下，
+		// 例如 [01:33.13]認めたら / [01:33.13]若然内心承认了的话
+		const timeCount = new Map<number, number>();
+		for (const line of originalParsed) {
+			timeCount.set(line.time, (timeCount.get(line.time) ?? 0) + 1);
+		}
+		// 每个时间戳只保留第一行作为原文，其余行作为翻译
+		const keptTimes = new Set<number>();
+		const result: LyricLine[] = [];
+		const dupedTranslations = new Map<number, string>();
+		for (const line of originalParsed) {
+			if (timeCount.get(line.time) === 1) {
+				result.push({
+					time: line.time,
+					originalLyric: line.lyric,
+					duration: 0,
+					...(line.unsynced ? { unsynced: true } : {}),
+				});
+			} else if (!keptTimes.has(line.time)) {
+				keptTimes.add(line.time);
+				result.push({
+					time: line.time,
+					originalLyric: line.lyric,
+					duration: 0,
+					...(line.unsynced ? { unsynced: true } : {}),
+				});
+			} else {
+				// 同一时间戳的后续行视为翻译
+				dupedTranslations.set(
+					line.time,
+					(dupedTranslations.get(line.time) ?? '') + line.lyric
+				);
+			}
+		}
+		// 将重复时间戳的翻译附加到对应原文行
+		for (const [time, trans] of dupedTranslations) {
+			const target = result.find((v) => v.time === time);
+			if (target) {
+				target.translatedLyric = trans;
+			}
+		}
 
 		const translatedLines = parsePureLyric(translated);
 		const romanLines = parsePureLyric(roman);
@@ -123,7 +167,9 @@ export function parseLyric(
 		translatedLines.forEach((line) => {
 			const target = result.find((v) => v.time === line.time);
 			if (target) {
-				target.translatedLyric = line.lyric;
+				target.translatedLyric = target.translatedLyric
+					? target.translatedLyric + ' ' + line.lyric
+					: line.lyric;
 			}
 		});
 
