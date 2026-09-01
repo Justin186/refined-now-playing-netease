@@ -36,7 +36,13 @@ https://github.com/user-attachments/assets/e2568e3d-8390-4682-9798-f8e0d5b24755
 
 ### 调试输出开关
 
-设置 → 杂项 → 勾选「AI 逐字歌词调试输出」后，会在 Console 中额外输出后端返回的原始 LRC（`standard_lrc` / `enhanced_lrc`），便于排查后端对齐结果。默认关闭。
+设置 → 杂项 → 勾选「AI 逐字歌词调试输出」后，会在 Console 中额外输出后端返回的 `standard_lrc` / `enhanced_lrc`。默认关闭。
+
+> **已知竞态与修复**：切歌瞬间 `onProcessLyrics` 触发时，LibFrontendPlay 复用的 `<audio>` 元素可能仍是上一首歌的元数据（`src` / `duration` 未更新）。此时若直接按旧 `src` 计算缓存 key，会命中上一首歌的音频缓存，把旧歌音频发给后端。已通过以下机制修复：
+> 1. 用 `getPlaying().dt` 获取新歌期望时长，等待 `audio.duration` 匹配新歌后才继续下载；
+> 2. `getPlaying().dt` 不可用时，用 `lastProcessedSongId`/`lastProcessedSrc` 追踪最近处理过的歌曲，检测音频元素是否仍是旧歌元数据（`isAudioStale`），是则继续等待或中止；
+> 3. 时长校验中增加 `getPlaying()` 交叉校验兜底；
+> 4. 在线歌曲缓存 key 改用稳定的 `songID`（CDN URL 带时间戳，用 src 作 key 会导致缓存永远命中不了）。
 
 如果 Console 中完全没有 `[AI Lyric]` 输出，请检查：
 

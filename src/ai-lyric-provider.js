@@ -13,14 +13,68 @@ import { getSetting } from './utils.js';
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
 
+// 获取当前播放歌曲的期望时长（秒），用于等待音频元素切换到新歌。
+// 网易云歌曲对象带 dt 字段（毫秒）。取不到时返回 null（退回旧逻辑）。
+// 关键：切歌时 LibFrontendPlay 复用同一 <audio> 元素，其 readyState/duration
+// 可能仍是上一首歌的旧元数据，必须用新歌期望时长来判断音频是否已切换。
+const getExpectedDurationSec = () => {
+	try {
+		const playing = betterncm?.ncm?.getPlaying?.();
+		const dt = playing?.dt;
+		if (dt && isFinite(dt) && dt > 0) return dt / 1000;
+	} catch (e) {
+		// 忽略
+	}
+	return null;
+};
+
+// 记录最近一次成功处理的歌曲身份，用于在 getPlaying().dt 不可用时，
+// 检测音频元素是否仍是旧歌元数据（切歌竞态）。
+let lastProcessedSongId = null;
+let lastProcessedSrc = null;
+
+// 判断音频元素是否可能是旧歌元数据（切歌竞态）。
+// 原理：若音频身份（src/localPath）仍是上一首处理过的歌曲、但当前播放的已是新歌，
+// 说明 LibFrontendPlay 复用的 <audio> 元素还没切到新歌，其 readyState/duration 是旧歌的。
+// 首播（从未处理过）时返回 false，不阻塞正常流程。
+// el：正在检查就绪状态的 audio 元素。若它不是当前播放元素（LibFrontendPlay 重建了新元素），
+// 则视为"旧元素"，返回 true（不算就绪），避免在旧元素的旧元数据上误判。
+const isAudioStale = (el) => {
+	try {
+		if (lastProcessedSongId == null) return false; // 首播，无旧歌可复用
+		const cur = getCurrentAudio() ?? {};
+		// 传入元素不是当前播放元素 → 已重建新元素，旧元素不算数
+		if (el && cur.audio && el !== cur.audio) return true;
+		const curIdentity = cur.localPath || cur.audio?.src || null;
+		// 音频身份已变化 → 已切到新歌，不是旧元数据
+		if (curIdentity && lastProcessedSrc && curIdentity !== lastProcessedSrc) return false;
+		// 音频身份仍是上一首的，且当前播放的已是新歌 → 音频元素是旧元数据
+		const playingId = betterncm?.ncm?.getPlaying?.()?.id;
+		return playingId != null && String(playingId) !== String(lastProcessedSongId);
+	} catch (e) {
+		return false;
+	}
+};
+
 // 音频 Blob 内存缓存：避免同一首歌重复下载浪费流量。
 // key 为在线歌曲的 audio.src 或本地文件的 localPath，value 为下载好的完整 Blob。
 // 只缓存最近几首，防止内存无限增长。
 const audioBlobCache = new Map();
 const AUDIO_CACHE_MAX = 5;
 
-// 获取音频缓存 key（在线用 src，本地用 localPath）
-const getAudioCacheKey = (audio, localPath) => localPath || audio?.src || null;
+// 获取音频缓存 key（在线优先用 songID，本地用 localPath）
+// 在线歌曲的 CDN URL 带时间戳，同一首歌再次播放时 URL 可能变化，
+// 若用 src 作 key 会导致缓存永远命中不了；songID 稳定，可正确复用缓存。
+const getAudioCacheKey = (audio, localPath) => {
+	if (localPath) return localPath;
+	try {
+		const id = betterncm?.ncm?.getPlaying?.()?.id;
+		if (id != null) return `song:${id}`;
+	} catch (e) {
+		// 忽略
+	}
+	return audio?.src || null;
+};
 
 // 写入缓存（超出上限时淘汰最旧的）
 const cacheAudioBlob = (key, blob) => {
@@ -60,10 +114,22 @@ const getAudioBlobDuration = async (blob) => {
 // 若时长明显不符（差异 > 5 秒），说明下载到了错误的歌曲（切歌竞态），返回 false。
 // 时长无法获取（解码失败/无 duration）时保守放行，不阻塞正常流程。
 const isBlobDurationMatching = async (blob, audio) => {
-	const expected = audio?.duration;
-	if (!expected || !isFinite(expected) || expected <= 0) return true; // 无参考时长，放行
 	const actual = await getAudioBlobDuration(blob);
 	if (actual == null || !isFinite(actual) || actual <= 0) return true; // 无法解码，放行
+
+	// 交叉校验：若能从 getPlaying() 拿到期望时长，也一并校验，
+	// 防止 audio 元素仍是旧歌元数据时，旧 blob 与旧 duration 误判匹配。
+	const expectedFromPlaying = getExpectedDurationSec();
+	if (expectedFromPlaying != null && isFinite(expectedFromPlaying) && expectedFromPlaying > 0) {
+		const diff = Math.abs(actual - expectedFromPlaying);
+		if (diff > 5) {
+			console.warn(`[AI Lyric] 音频时长与期望歌曲不符（getPlaying）：blob=${actual.toFixed(1)}s，期望=${expectedFromPlaying.toFixed(1)}s`);
+			return false;
+		}
+	}
+
+	const expected = audio?.duration;
+	if (!expected || !isFinite(expected) || expected <= 0) return true; // 无参考时长，放行
 	// 允许 5 秒误差（不同编码/截断可能略有差异）
 	const diff = Math.abs(actual - expected);
 	if (diff > 5) {
@@ -109,13 +175,28 @@ export const getCurrentAudio = () => {
 // 下载完成即代表完整，无需依赖 audio 元素缓慢的流式缓冲（那会白白等几十秒）。
 // 
 // 处理策略：
-//   1. 快速路径：若传入的 audio 元素已就绪则直接返回。
+//   1. 快速路径：若传入的 audio 元素已就绪且与期望歌曲一致则直接返回。
 //   2. 事件监听：在传入的 audio 上监听 loadedmetadata。
 //   3. 轮询兜底：定期重新获取 getCurrentAudio()，防止 LibFrontendPlay 切歌时
 //      创建了新的 <audio> 元素导致旧元素永远不会触发 loadedmetadata。
-const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
-	// 元数据已就绪（duration 可用）则直接返回
-	if (audio.readyState >= 1 && audio.duration > 0) return true;
+//
+// expectedDurationSec：期望歌曲时长（秒，来自 getPlaying().dt）。
+//   关键：切歌时 LibFrontendPlay 复用同一 <audio> 元素，其 readyState/duration
+//   可能仍是上一首歌的旧元数据，此时不能算"就绪"，必须等时长匹配新歌才算切换完成。
+//   无期望时长时，用 isAudioStale() 检测音频元素是否仍是旧歌元数据，是则继续等待。
+const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs = 8000) => {
+	// 判断 audio 元素是否已就绪且与期望歌曲一致
+	const isReady = (el) => {
+		if (!el || el.readyState < 1 || !(el.duration > 0)) return false;
+		if (expectedDurationSec != null && isFinite(expectedDurationSec) && expectedDurationSec > 0) {
+			return Math.abs(el.duration - expectedDurationSec) <= 2;
+		}
+		// 无期望时长时，若音频元素仍是旧歌元数据，则不算就绪
+		return !isAudioStale(el);
+	};
+
+	// 元数据已就绪且与期望歌曲一致则直接返回
+	if (isReady(audio)) return true;
 
 	return new Promise((resolve) => {
 		let resolved = false;
@@ -134,12 +215,15 @@ const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
 			resolve(true);
 		};
 
-		// 监听传入 audio 的 loadedmetadata（快速路径）
-		const onLoaded = () => resolveOnce();
+		// 监听 loadedmetadata：事件触发时重新校验是否已切到新歌
+		const onLoaded = (e) => {
+			const el = e?.target ?? audio;
+			if (isReady(el)) resolveOnce();
+		};
 		audio.addEventListener('loadedmetadata', onLoaded);
 
 		// 竞态保护：本地文件加载极快，loadedmetadata 可能在添加监听前已触发
-		if (audio.readyState >= 1 && audio.duration > 0) {
+		if (isReady(audio)) {
 			resolveOnce();
 			return;
 		}
@@ -158,7 +242,7 @@ const waitForAudioMetadata = async (audio, timeoutMs = 8000) => {
 				if (cur && !seenAudios.has(cur)) {
 					seenAudios.add(cur);
 					cur.addEventListener('loadedmetadata', onLoaded);
-					if (cur.readyState >= 1 && cur.duration > 0) {
+					if (isReady(cur)) {
 						resolveOnce();
 						return;
 					}
@@ -506,9 +590,13 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 		console.log('[AI Lyric] 未找到 LibFrontendPlay 音频，跳过 AI 处理');
 		return null;
 	}
+	// 计算期望歌曲时长（秒），用于等待音频元素切换到新歌
+	const expectedDurationSec = getExpectedDurationSec();
 
 	// 3. 只等音频元数据就绪（确保 src 已切换到新歌），不等待缓冲完整
-	await waitForAudioMetadata(audio);
+	//    传入期望歌曲时长：切歌时 LibFrontendPlay 复用同一 <audio> 元素，
+	//    其 readyState/duration 可能仍是上一首歌的旧元数据，必须等时长匹配新歌才算就绪。
+	await waitForAudioMetadata(audio, expectedDurationSec);
 
 	// 3.5 重新获取当前音频，确保 src/localPath 已切换到新歌。
 	//     切歌瞬间触发本函数时，步骤 2 拿到的 audio.src 可能还是上一首歌的 URL，
@@ -517,6 +605,13 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	const current = getCurrentAudio() ?? {};
 	const currentAudio = current.audio ?? audio;
 	const currentLocalPath = current.localPath ?? localPath;
+
+	// 3.55 兜底：等待后音频元素仍是旧歌元数据（超时未切换），
+	//      此时继续会用旧歌 src 计算缓存 key，把旧歌音频发给后端，直接中止。
+	if (isAudioStale(currentAudio)) {
+		console.warn('[AI Lyric] 等待后音频元素仍是旧歌元数据，中止本次 AI 处理');
+		return null;
+	}
 
 	// 3.6 切歌检测：等待元数据期间用户可能已切到下一首。
 	//     此时当前音频/歌曲信息已属于新歌，但本函数闭包里的 lyrics 仍是旧歌的，
@@ -608,7 +703,7 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 				console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
 				if (attempt < 2) {
 					await new Promise((r) => setTimeout(r, 1500));
-					await waitForAudioMetadata(freshAudio, 5000);
+					await waitForAudioMetadata(freshAudio, expectedDurationSec, 5000);
 				}
 			}
 		}
@@ -631,11 +726,12 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	//    本地文件用其扩展名作为音频文件名，便于后端识别格式
 	const extMatch = effectiveLocalPath ? effectiveLocalPath.match(/\.(\w+)$/) : null;
 	const audioFileName = extMatch ? `audio.${extMatch[1]}` : 'audio.bin';
+	const songInfo = getSongInfo();
 	let result;
 	let requestOk = false;
 	for (let attempt = 0; attempt < 2 && !requestOk; attempt++) {
 		try {
-			result = await requestAILyric(audioBlob, originalLyricText, getSongInfo(), times, audioFileName);
+			result = await requestAILyric(audioBlob, originalLyricText, songInfo, times, audioFileName);
 			requestOk = true;
 		} catch (e) {
 			console.warn(`[AI Lyric] 请求后端失败 (第 ${attempt + 1} 次)`, e);
@@ -694,6 +790,10 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 			};
 		});
 	}
+
+	// 记录最近一次成功处理的歌曲身份，供 isAudioStale() 检测切歌竞态
+	lastProcessedSongId = expectedSongId ?? betterncm?.ncm?.getPlaying?.()?.id ?? null;
+	lastProcessedSrc = effectiveLocalPath || effectiveAudio?.src || null;
 
 	console.log('[AI Lyric] 已应用 AI 逐字歌词');
 	return newLyrics;
