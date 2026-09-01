@@ -117,8 +117,11 @@ const isBlobDurationMatching = async (blob, audio) => {
 	const actual = await getAudioBlobDuration(blob);
 	if (actual == null || !isFinite(actual) || actual <= 0) return true; // 无法解码，放行
 
-	// 交叉校验：若能从 getPlaying() 拿到期望时长，也一并校验，
-	// 防止 audio 元素仍是旧歌元数据时，旧 blob 与旧 duration 误判匹配。
+	// 优先用 getPlaying().dt 作为期望时长（网易云歌曲对象的真实时长，最可靠）。
+	// 关键：audio 元素的 duration 可能是上一首歌的旧元数据（切歌时 LibFrontendPlay
+	// 复用同一 <audio> 元素，其 duration 还没更新到新歌），用它校验会把"已下载到的新歌"
+	// 误判为旧歌。而 getPlaying().dt 始终是当前播放歌曲的真实时长，不会受 audio 元素
+	// 元数据滞后影响。因此只要 getPlaying().dt 可用，就完全以它为准。
 	const expectedFromPlaying = getExpectedDurationSec();
 	if (expectedFromPlaying != null && isFinite(expectedFromPlaying) && expectedFromPlaying > 0) {
 		const diff = Math.abs(actual - expectedFromPlaying);
@@ -126,8 +129,11 @@ const isBlobDurationMatching = async (blob, audio) => {
 			console.warn(`[AI Lyric] 音频时长与期望歌曲不符（getPlaying）：blob=${actual.toFixed(1)}s，期望=${expectedFromPlaying.toFixed(1)}s`);
 			return false;
 		}
+		// getPlaying().dt 可用且匹配，直接放行（不再用 audio.duration，避免旧元数据误判）
+		return true;
 	}
 
+	// getPlaying().dt 不可用时，退回用 audio 元素 duration 校验（此时无更可靠来源）
 	const expected = audio?.duration;
 	if (!expected || !isFinite(expected) || expected <= 0) return true; // 无参考时长，放行
 	// 允许 5 秒误差（不同编码/截断可能略有差异）
@@ -265,6 +271,25 @@ const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs
 			});
 		};
 	});
+};
+
+// 判断是否为"占位歌词"（纯音乐/暂无歌词等），这些没有实际歌词内容，不应发往后端。
+// 网易云对无歌词歌曲会返回固定的占位文本，如：
+//   - "纯音乐，请欣赏"（纯音乐）
+//   - "暂无歌词"（无歌词）
+// 这些文本没有逐字对齐价值，发给后端只会浪费流量并可能产生错误结果。
+const isPlaceholderLyric = (text) => {
+	if (!text) return false;
+	const t = text.trim();
+	if (!t) return false;
+	// 整段文本只由占位句 + 元数据行（作词/作曲等）组成时视为占位歌词
+	const lines = t.split('\n').map((l) => l.trim()).filter(Boolean);
+	if (lines.length === 0) return false;
+	// 至少包含一个明确的占位句
+	const hasPlaceholder = lines.some((l) => /^(纯音乐，请欣赏|暂无歌词|纯音乐|无歌词)$/.test(l));
+	if (!hasPlaceholder) return false;
+	// 其余行只能是元数据行（作词/作曲/编曲等），否则视为有真实歌词
+	return lines.every((l) => /^(纯音乐，请欣赏|暂无歌词|纯音乐|无歌词)$/.test(l) || isMetadataLine(l));
 };
 
 // 把解析后的歌词行拼成带换行的纯文本（仅原文，按时间顺序）
@@ -579,8 +604,15 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 
 	// 1. 没有歌词文本就不处理
 	const { text: originalLyricText, times, start } = buildOriginalLyricText(lyrics);
+
 	if (!originalLyricText) {
 		console.log('[AI Lyric] 歌曲没有歌词文本，跳过 AI 处理');
+		return null;
+	}
+
+	// 1.5 占位歌词（纯音乐/暂无歌词）不处理，避免误发后端
+	if (isPlaceholderLyric(originalLyricText)) {
+		console.log('[AI Lyric] 检测到占位歌词（纯音乐/暂无歌词），跳过 AI 处理:', JSON.stringify(originalLyricText));
 		return null;
 	}
 
@@ -727,6 +759,7 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	const extMatch = effectiveLocalPath ? effectiveLocalPath.match(/\.(\w+)$/) : null;
 	const audioFileName = extMatch ? `audio.${extMatch[1]}` : 'audio.bin';
 	const songInfo = getSongInfo();
+
 	let result;
 	let requestOk = false;
 	for (let attempt = 0; attempt < 2 && !requestOk; attempt++) {
