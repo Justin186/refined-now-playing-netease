@@ -8,10 +8,38 @@
 //                         返回 { code: 200, data: { standard_lrc, enhanced_lrc } }
 //   enhanced_lrc 为 ESLRC 逐字格式：行首 [mm:ss.xx] 为行起始，每个词后跟 [mm:ss.xx] 为词结束时间
 
-import { getSetting } from './utils.js';
+import { getSetting, cyrb53 } from './utils.js';
 
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
+
+// AI 逐字歌词结果缓存：避免同一首歌（单曲循环/切歌时多次触发 onProcessLyrics）重复请求后端。
+// key 为 `${songId}-${lyricHash}`（songId 用 expectedSongId，lyricHash 用歌词文本的 cyrb53）。
+// value 为 applyAILyric 处理后的歌词数组（含 dynamicLyric）。
+// 只缓存最近几首，防止内存无限增长。
+const aiLyricResultCache = new Map();
+const AI_LYRIC_CACHE_MAX = 10;
+
+// 正在处理中的 AI 请求 key 集合：避免同一首歌并发触发多个相同请求。
+// 切歌时网易云可能短时间内多次调用 onProcessLyrics，若每次都发请求会浪费流量。
+const pendingAIRequests = new Set();
+
+// 写入 AI 歌词结果缓存（超出上限时淘汰最旧的）
+const cacheAILyricResult = (key, lyrics) => {
+	aiLyricResultCache.set(key, lyrics);
+	if (aiLyricResultCache.size > AI_LYRIC_CACHE_MAX) {
+		const oldestKey = aiLyricResultCache.keys().next().value;
+		aiLyricResultCache.delete(oldestKey);
+	}
+};
+
+// 计算 AI 歌词缓存 key：基于歌曲身份 + 歌词文本
+// expectedSongId 可能为 undefined（本地歌词），此时退回用歌词文本 hash
+const getAILyricCacheKey = (lyrics, expectedSongId) => {
+	const text = (lyrics ?? []).map((x) => x?.originalLyric ?? '').join('\\');
+	const lyricHash = cyrb53(text);
+	return `${expectedSongId ?? 'local'}-${lyricHash}`;
+};
 
 // 获取当前播放歌曲的期望时长（秒），用于等待音频元素切换到新歌。
 // 网易云歌曲对象带 dt 字段（毫秒）。取不到时返回 null（退回旧逻辑）。
@@ -602,6 +630,31 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 		return null;
 	}
 
+	// 0.5 缓存命中：同一首歌（相同 songId + 歌词文本）已处理过，直接复用结果，
+	//     避免单曲循环/切歌时重复请求后端。
+	const cacheKey = getAILyricCacheKey(lyrics, expectedSongId);
+	if (aiLyricResultCache.has(cacheKey)) {
+		console.log('[AI Lyric] 命中 AI 歌词结果缓存，跳过后端请求');
+		return aiLyricResultCache.get(cacheKey);
+	}
+
+	// 0.6 防重入：同一首歌正在处理中时，跳过本次（避免并发重复请求）。
+	//     切歌时网易云可能短时间内多次调用 onProcessLyrics，若每次都发请求会浪费流量。
+	if (pendingAIRequests.has(cacheKey)) {
+		console.log('[AI Lyric] 该歌曲正在处理中，跳过本次请求');
+		return null;
+	}
+	pendingAIRequests.add(cacheKey);
+	try {
+		return await doApplyAILyric(lyrics, expectedSongId, expectedSrc, cacheKey);
+	} finally {
+		pendingAIRequests.delete(cacheKey);
+	}
+}
+
+// applyAILyric 的实际处理逻辑（被 applyAILyric 的缓存/防重入包装调用）
+async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
+
 	// 1. 没有歌词文本就不处理
 	const { text: originalLyricText, times, start } = buildOriginalLyricText(lyrics);
 
@@ -828,6 +881,9 @@ export async function applyAILyric(lyrics, expectedSongId, expectedSrc) {
 	// 记录最近一次成功处理的歌曲身份，供 isAudioStale() 检测切歌竞态
 	lastProcessedSongId = expectedSongId ?? betterncm?.ncm?.getPlaying?.()?.id ?? null;
 	lastProcessedSrc = effectiveLocalPath || effectiveAudio?.src || null;
+
+	// 写入 AI 歌词结果缓存，供同一首歌再次播放时复用
+	cacheAILyricResult(aiCacheKey, newLyrics);
 
 	console.log('[AI Lyric] 已应用 AI 逐字歌词');
 	return newLyrics;
