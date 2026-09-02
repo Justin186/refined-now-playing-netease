@@ -32,8 +32,16 @@ export function MiniSongInfo(props) {
 	const infContainer = props.infContainer;
 	useEffect(() => {
 		const onObverse = () => {
-			const title = infContainer.querySelector('.title .name').textContent.trim();
-			const artist = Array.from(infContainer.querySelectorAll('.info .playfrom > li:first-child a')).map(a => a.textContent.trim()).join(' / ');
+			const title = infContainer.querySelector('.title .name')?.textContent?.trim() ?? '';
+			// 优先从 .playfrom > li:first-child 中的 <a> 获取歌手（普通歌曲），
+			// 若为空则尝试 <span class="artist">（云盘歌曲的歌手信息在此处）
+			let artist = Array.from(infContainer.querySelectorAll('.info .playfrom > li:first-child a')).map(a => a.textContent.trim()).join(' / ');
+			if (!artist) {
+				const artistSpan = infContainer.querySelector('.info .playfrom .artist');
+				if (artistSpan) {
+					artist = artistSpan.textContent.trim();
+				}
+			}
 			setTitle(title);
 			setArtist(artist);
 		};

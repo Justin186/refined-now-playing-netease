@@ -333,6 +333,12 @@ body.mq-playing:not(.enable-accent-color) .m-pinfo .btn-love.loved:before {
 		.head .inf .info ul{
 			li {
 				font-size: 0;
+				// 云盘歌曲的歌手/专辑信息放在 <span class="artist"> / <span class="album"> 里（非 <a> 链接），
+				// 需要恢复字体大小，否则会被上面的 font-size: 0 隐藏
+				.artist, .album {
+					font-size: 16px;
+					color: rgba(var(--rnp-accent-color-shade-2-rgb), 0.45);
+				}
 				a {
 					font-size: 16px;
 					transition: color .3s ease;
