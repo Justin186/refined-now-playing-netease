@@ -4,8 +4,8 @@
 import { parseLyric } from './liblyric/index.ts'
 import { cyrb53, getSetting } from './utils.js'
 import { applyAILyric, getCurrentAudio, isMetadataLine } from './ai-lyric-provider.js'
-// 窗口最小化时主线程 setTimeout 会被 Chromium 节流，用 Worker 定时器保证后台切歌时歌词流水线照常推进
-import { setTimeoutUnthrottled } from './wake-timer.js'
+// 注：曾有 wake-timer.js 用 blob: Worker 防节流，但 orpheus:// 宿主 CSP 禁止 blob: Worker，已移除。
+// 此处的 setTimeout(0) 仅把歌词处理让出到宏任务；最小化时的推进由 AI 流水线的事件驱动等待保证。
 
 const preProcessLyrics = (lyrics) => {
 	if (!lyrics) return null;
@@ -152,7 +152,7 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 			// 忽略，expectedSrc 保持 null（此时仅靠 songID 校验）
 		}
 
-		setTimeoutUnthrottled(async () => {
+		setTimeout(async () => {
 			let processedLyrics = await processLyrics(preprocessedLyrics);
 
 			// AI 逐字歌词处理：从 LibFrontendPlay 获取音频，连同歌词文本发送到本地后端，

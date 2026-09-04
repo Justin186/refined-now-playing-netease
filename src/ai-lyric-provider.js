@@ -9,9 +9,13 @@
 //   enhanced_lrc 为 ESLRC 逐字格式：行首 [mm:ss.xx] 为行起始，每个词后跟 [mm:ss.xx] 为词结束时间
 
 import { getSetting, cyrb53 } from './utils.js';
-// 网易云窗口最小化时 Chromium 会节流主线程 setTimeout 链，
-// 导致 AI 流水线（轮询元数据/重试/探测端口）停摆。改用 Worker 定时器不受节流影响。
-import { setTimeoutUnthrottled, clearTimeoutUnthrottled, sleepUnthrottled } from './wake-timer.js';
+
+// 注：曾有 wake-timer.js 用 blob: Worker 实现"防节流定时器"，但 orpheus:// 宿主的 CSP
+// 禁止 blob: Worker（script-src 白名单无 blob:，worker-src 未设置而回退 script-src），
+// Worker 必然创建失败，该方案已移除。最小化时的停摆风险已由"事件驱动等待"
+// （waitUntilAudioAligned / waitForAudioMetadata 的事件路径）消化，定时器仅作兜底，
+// 被节流时只会变慢、不会出错。
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
@@ -237,9 +241,9 @@ const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs
 
 	return new Promise((resolve) => {
 		let resolved = false;
-		// 用 Worker 定时器：窗口最小化时主线程 setTimeout 会被节流到 1s 甚至 1min 一次，
-		// 整个等待逻辑会停摆；Worker 定时器不受页面可见性影响。
-		const timeout = setTimeoutUnthrottled(() => {
+		// 等待音频元数据超时的截止定时器：窗口最小化时可能被节流推迟，
+		// 只会让"尝试直接下载"来得更晚，方向安全（门禁在下游兜底归属校验）。
+		const timeout = setTimeout(() => {
 			if (resolved) return;
 			resolved = true;
 			cleanupAll();
@@ -290,14 +294,14 @@ const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs
 				// 忽略轮询中的异常
 			}
 		if (!resolved) {
-			pollTimer = setTimeoutUnthrottled(poll, 500);
+			pollTimer = setTimeout(poll, 500);
 		}
 	};
-	pollTimer = setTimeoutUnthrottled(poll, 500);
+	pollTimer = setTimeout(poll, 500);
 
 	const cleanupAll = () => {
-		clearTimeoutUnthrottled(timeout);
-		clearTimeoutUnthrottled(pollTimer);
+		clearTimeout(timeout);
+		clearTimeout(pollTimer);
 			// 移除所有已添加的事件监听
 			seenAudios.forEach((el) => {
 				el.removeEventListener('loadedmetadata', onLoaded);
@@ -348,12 +352,13 @@ const findActiveBackendPort = async (startPort = AI_BACKEND_START_PORT, maxTries
 	for (let port = startPort; port < startPort + maxTries; port++) {
 		try {
 			const controller = new AbortController();
-			// 探测超时同样用 Worker 定时器，避免最小化时中止信号延迟、拖慢端口探测
-			const timeoutId = setTimeoutUnthrottled(() => controller.abort(), 300);
+			// 探测超时的 abort 兜底：连接拒绝由系统层立即返回，此定时器只防极慢响应，
+			// 最小化被节流时最多让单个死端口的等待变长，不影响正常流程
+			const timeoutId = setTimeout(() => controller.abort(), 300);
 			const response = await fetch(`http://127.0.0.1:${port}/api/ping`, {
 				signal: controller.signal,
 			});
-			clearTimeoutUnthrottled(timeoutId);
+			clearTimeout(timeoutId);
 			if (response.ok) {
 				const data = await response.json();
 				if (data.app === 'lrc-maker-ai') {
@@ -596,6 +601,15 @@ const getSongInfo = () => {
 	}
 };
 
+// 【PROBE】仅供排障日志使用：返回当前 getPlaying() 的歌名（尽力而为）
+const songTitleProbe = () => {
+	try {
+		return betterncm?.ncm?.getPlaying?.()?.name ?? '(null)';
+	} catch (e) {
+		return '(err)';
+	}
+};
+
 // 判断当前播放的歌曲是否仍与期望的歌曲一致。
 // 用于在异步 AI 处理期间检测用户是否已切歌：若已切歌则中止本次处理，
 // 避免把"上一首的歌词文本 + 当前播放的音频"错配发给后端。
@@ -625,6 +639,223 @@ const isSongStillCurrent = (expectedSongId, expectedSrc) => {
 		// 校验失败时保守起见放行（不阻塞正常流程）
 		return true;
 	}
+};
+
+// 【PROBE 限频】unknown/unaligned 诊断日志最多每秒一条，避免刷屏
+let lastAlignProbeAt = 0;
+
+// ===== 尺子 2：换源时序绑定（不依赖 dt，本地歌曲的主尺子）=====
+// 原理：LibFrontendPlay 派发 updateCurrentAudioPlayer 的瞬间正在换/刚换好音频源，
+// 而歌词回调（onProcessLyrics）先于音频换源触发（运行日志已证实），因此换源瞬间
+// getPlaying().id 必然已指向目标歌。记录"最近一次换源瞬间 getPlaying().id"，
+// 与期望歌 ID 一致即证明音频源已切实换到本首歌——对 src 为不透明 token 的
+// 本地歌曲（http://localhost:5451/mounted_file/...）同样有效。
+// 实测：本地歌曲 getPlaying().dt 为 undefined，dt 尺子对这些歌永远 unknown，
+// 故本尺子是本地场景下唯一可靠的归属裁决。
+let swapSongId = null; // 最近一次换源事件触发瞬间 getPlaying().id
+let swapObserved = false; // 本会话是否观察到过换源事件
+let swapWatcherInstalled = false;
+
+// 全局安装换源监听（安装后常驻，不随单次等待清理——绑定状态需跨等待累积）。
+// LFP 可能在本模块加载后才就绪，故除模块初始化外，每次门禁等待入口与兜底轮询都会重试安装。
+const ensureSwapWatcher = () => {
+	if (swapWatcherInstalled) return;
+	const lfp = window.loadedPlugins?.LibFrontendPlay;
+	if (!lfp?.addEventListener) return;
+	try {
+		lfp.addEventListener('updateCurrentAudioPlayer', () => {
+			swapObserved = true;
+			try {
+				swapSongId = betterncm?.ncm?.getPlaying?.()?.id ?? null;
+			} catch (e) {
+				// 忽略：保留上一次绑定
+			}
+		});
+		swapWatcherInstalled = true;
+	} catch (e) {
+		// 忽略，下次重试
+	}
+};
+
+// 判定换源绑定：'aligned'（本会话最近一次换源绑定的歌就是期望歌）｜'unaligned'｜'unknown'
+const judgeSwapBinding = (expectedSongId) => {
+	if (!swapObserved || expectedSongId == null || swapSongId == null) return 'unknown';
+	return String(swapSongId) === String(expectedSongId) ? 'aligned' : 'unaligned';
+};
+
+// 模块加载即尝试安装换源监听：LFP 若已就绪则尽早开始积累绑定状态
+ensureSwapWatcher();
+
+// 判断"当前音频元素相对于本首歌的对齐程度"。
+//
+// 背景：切歌瞬间 onProcessLyrics 触发时，LibFrontendPlay 复用的 <audio> 元素常常
+// 还挂着上一首歌的 src/metadata（这也是当初捕获的 expectedSrc 可能被污染成旧歌的原因）。
+// 若不加以甄别就拿 getCurrentAudio() 的返回值去下载，会把"上一首的音频 + 当前歌词"错配
+// 发给后端（表现为：音频是旧的、歌词是新的）。
+//
+// 双尺子合成裁决（任一 aligned 即可信；两把尺子打架时保守按 unknown 继续等）：
+//   尺子 1 —— dt 时长对比：getPlaying().dt 与 audio.duration 逼近（在线歌曲 dt 可得时最直接；
+//             实测本地歌曲 dt 为 undefined，此尺子对它们恒为 unknown）。
+//   尺子 2 —— 换源时序绑定：本会话最近一次 updateCurrentAudioPlayer 绑定的歌 ID 与期望一致
+//             （不依赖 dt，本地歌曲的主尺子；会话内从未观察到换源事件时为 unknown）。
+//
+// ⚠️ 关键约定（吸取教训）：本函数返回三种状态，唯有 'aligned' 才是"可以放心下载"。
+// 任何"说不准"的情形都必须如实上报为 'unknown'，严禁乐观放行。"宁可多等或放弃，
+// 绝不冒拿旧音频出手的险"是本函数的铁律。
+//
+// 返回：
+//   - 'aligned'   ：至少一把尺子确认音频已切到本首歌，可放心下载。
+//   - 'unaligned' ：有尺子确认音频还滞留在别的歌上。
+//   - 'unknown'   ：缺乏足够的可信依据，无法断定已对齐。
+const judgeAudioAlignment = (expectedSongId) => {
+	try {
+		const reasons = [];
+		const verdicts = [];
+
+		// 尺子 2：换源时序绑定
+		const swapVerdict = judgeSwapBinding(expectedSongId);
+		verdicts.push(swapVerdict);
+		reasons.push(`换源绑定=${swapVerdict}(bound=${swapSongId ?? '(null)'})`);
+
+		// 尺子 1：dt 时长对比
+		const playing = betterncm?.ncm?.getPlaying?.();
+		const dtRaw = playing?.dt;
+		const expectedDur = (dtRaw && isFinite(dtRaw) && dtRaw > 0) ? dtRaw / 1000 : null;
+		const cur = getCurrentAudio() ?? {};
+		const audio = cur.audio ?? null;
+		const dur = audio?.duration;
+		let dtVerdict = 'unknown';
+		if (expectedDur == null) {
+			reasons.push(`dt 不可用 (dtRaw=${String(dtRaw)})`);
+		} else if (dur == null || !isFinite(dur) || dur <= 0) {
+			reasons.push(`audio 元数据不可用 (readyState=${audio ? audio.readyState : '无元素'})`);
+		} else {
+			dtVerdict = Math.abs(dur - expectedDur) <= 2 ? 'aligned' : 'unaligned';
+			reasons.push(`dt=${expectedDur.toFixed(2)}s duration=${dur.toFixed(2)}s`);
+		}
+		verdicts.push(dtVerdict);
+
+		// 合成：aligned 与 unaligned 并存说明尺子打架，保守继续等
+		let verdict;
+		if (verdicts.includes('aligned') && verdicts.includes('unaligned')) verdict = 'unknown';
+		else if (verdicts.includes('aligned')) verdict = 'aligned';
+		else if (verdicts.includes('unaligned')) verdict = 'unaligned';
+		else verdict = 'unknown';
+
+		// 【PROBE】非 aligned 时限频取证
+		const now = Date.now();
+		if (verdict !== 'aligned' && now - lastAlignProbeAt >= 1000) {
+			lastAlignProbeAt = now;
+			console.log(
+				`[AI Lyric][probe] judgeAudioAlignment=${verdict} | ${reasons.join(' | ')} | playing.id=${
+					playing?.id ?? '(null)'
+				} curAudio=${audio ? String(audio.src || '(src空)').slice(0, 80) : '(null)'} localPath=${cur.localPath ?? '(null)'}`
+			);
+		}
+		return verdict;
+	} catch (e) {
+		return 'unknown';
+	}
+};
+
+// 在当前歌曲身份保持不变的前提下，等待音频元素切实切到本首歌。
+//
+// 【事件驱动 + 低频兜底】（重构自定时器轮询版）
+// 旧实现用 sleep(400) 轮询 judgeAudioAlignment，但 orpheus:// 宿主的 CSP
+// 禁止 blob: Worker（wake-timer.js 曾退回主线程 setTimeout，该文件现已移除），窗口最小化时定时器被
+// Chromium 节流到 ~1/min，7s 的等待窗口里几乎采不到样，合法的切歌被大面积误杀
+// （日志表现："限定时间内未能确认音频已切到本首歌"）。
+// 新实现让唤醒彻底摆脱定时器调度——三路信号都直接调用 evaluate() 立即采样判定，
+// 而事件处理函数不受页面可见性节流影响：
+//   信号 1：LibFrontendPlay 的 updateCurrentAudioPlayer 事件（切歌/换元素时天然触发，
+//           e.detail 携新 audio 元素）。
+//   信号 2：audio 元素自带媒体事件 loadedmetadata/durationchange/canplay（新歌元数据
+//           就绪的瞬间触发）；元素换代时对新元素补绑（防监听在旧元素上落空）。
+//   信号 3：低频 setInterval(~2.3s) 兜底（防个别事件漏发；频率压低，即便最小化被
+//           节流也只是轻度劣化，且顺带周期重绑新元素）。
+// 返回：'aligned'（已对齐，可下载）｜'switched'（已切歌，上层应终止）｜'giveup'（届满）。
+// maxWaitMs 默认上调到 28s：等待本身不再空转烧 CPU，多给时间换取"尽量纠正而非放弃"。
+const MEDIA_EVENT_HINTS = ['loadedmetadata', 'durationchange', 'canplay', 'playing', 'timeupdate'];
+
+const waitUntilAudioAligned = (expectedSongId, expectedSrc, maxWaitMs = 28000) => {
+	return new Promise((resolve) => {
+		// 【v2 标识】事件驱动版入口日志：确认新代码已生效（旧轮询版无此日志）
+		console.log(
+			`[AI Lyric] 门禁等待音频对齐（事件驱动 v2）: expectedSongId=${expectedSongId ?? '(null)'} 限期=${maxWaitMs}ms`
+		);
+		let settled = false;
+		let deadlineTimer = null;
+		const seenAudios = new Set();
+		const lfp = window.loadedPlugins?.LibFrontendPlay ?? null;
+
+		const cleanup = () => {
+			if (deadlineTimer != null) clearTimeout(deadlineTimer);
+			if (fallbackTimer != null) clearInterval(fallbackTimer);
+			if (lfp?.removeEventListener) {
+				try { lfp.removeEventListener('updateCurrentAudioPlayer', onPlayerSwap); } catch (e) { /* 忽略 */ }
+			}
+			seenAudios.forEach((el) => {
+				for (const ev of MEDIA_EVENT_HINTS) {
+					el.removeEventListener(ev, evaluate);
+				}
+			});
+			seenAudios.clear();
+		};
+
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve(result);
+		};
+
+		// 立即采样判定：检出切歌 → 'switched'；音频已切到本首歌 → 'aligned'；否则继续等下一信号
+		const evaluate = () => {
+			if (settled) return;
+			if (!isSongStillCurrent(expectedSongId, expectedSrc)) {
+				finish('switched');
+				return;
+			}
+			if (judgeAudioAlignment(expectedSongId) === 'aligned') finish('aligned');
+		};
+
+		// 元素换代跟进：对新出现的 audio 元素补挂媒体事件（同一元素只绑一次）
+		const bindMediaEvents = (el) => {
+			if (!el || seenAudios.has(el)) return;
+			seenAudios.add(el);
+			for (const ev of MEDIA_EVENT_HINTS) {
+				try { el.addEventListener(ev, evaluate); } catch (e) { /* 忽略 */ }
+			}
+		};
+
+		// 信号 1：LibFrontendPlay 换元素事件（e.detail 携新 audio 元素）
+		const onPlayerSwap = (e) => {
+			bindMediaEvents(e?.detail ?? null);
+			evaluate();
+		};
+
+		// 信号 3：低频兜底（防个别事件漏发 + 周期重绑新元素）
+		let fallbackTimer = null;
+
+		// 截止时间：最小化时该定时器可能被推迟触发，只会"多等"不会"早弃"，方向是安全的
+		deadlineTimer = setTimeout(() => finish('giveup'), maxWaitMs);
+
+		// 换源监听是绑定状态的数据源，LFP 晚就绪时在这里补装
+		ensureSwapWatcher();
+
+		if (lfp?.addEventListener) {
+			try { lfp.addEventListener('updateCurrentAudioPlayer', onPlayerSwap); } catch (e) { /* 忽略 */ }
+		}
+		fallbackTimer = setInterval(() => {
+			ensureSwapWatcher(); // 兜底轮询顺带重试安装换源监听（防 LFP 晚于本模块就绪）
+			bindMediaEvents(getCurrentAudio()?.audio ?? null);
+			evaluate();
+		}, 2300);
+
+		// 立即采样一次 + 绑定当前元素（快速路径：音频本就对齐时不产生任何等待）
+		bindMediaEvents(getCurrentAudio()?.audio ?? null);
+		evaluate();
+	});
 };
 
 // 把后端返回的逐字歌词应用到现有歌词行上
@@ -735,6 +966,26 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 				return { aborted: true };
 			}
 
+			// 【关键】音频归属门禁：确认当前 <audio> 元素已切实切到本首歌，再去碰它。
+			// 切歌瞬间 LibFrontendPlay 复用的 <audio> 元素可能仍挂着上一首歌的 src/metadata，
+			// 若无视之直接按其 src 下载，会把"上一首的音频 + 当前歌词"错配发给后端
+			// （表现为：音频是旧的、歌词是新的）。此处借 getPlaying().dt 这把稳尺子裁定
+			// 音频元素是否已切到新歌；未就位则在限期内耐心等待，其间若检出切歌则中止，
+			// 限期届满仍不到位便果断放弃——绝不在旧音频上下手。
+			const alignStatus = await waitUntilAudioAligned(expectedSongId, expectedSrc);
+			if (alignStatus === 'switched') {
+				console.log('[AI Lyric] 等待音频对齐期间检测到切歌，中止本次 AI 处理');
+				return { aborted: true };
+			}
+			if (alignStatus !== 'aligned') {
+				console.warn('[AI Lyric] 限定时间内未能确认音频已切到本首歌，为避免新旧错配放弃本次 AI 处理');
+				return { audioBlob: null };
+			}
+			// 【PROBE】门禁通过后将用什么 src 下载
+			console.log(
+				`[AI Lyric][probe] gate passed, downloading | expectedSongId=${expectedSongId ?? '(null)'} expectedSrc=${expectedSrc ?? '(null)'} | freshAudio.src=${freshAudio?.src ?? '(null)'} freshLocalPath=${freshLocalPath ?? '(null)'}`
+			);
+
 			const cacheKey = getAudioCacheKey(freshAudio, freshLocalPath);
 			let audioBlob = getCachedAudioBlob(cacheKey);
 			if (audioBlob) {
@@ -794,7 +1045,7 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 			} catch (e) {
 				console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
 				if (attempt < 2) {
-					await sleepUnthrottled(1500);
+					await sleep(1500);
 					await waitForAudioMetadata(freshAudio, expectedDurationSec, 5000);
 				}
 			}
@@ -814,6 +1065,12 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 	const effectiveAudio = downloadResult.audio;
 	const effectiveLocalPath = downloadResult.localPath;
 
+	// 【PROBE】即将发往后端的音频身份与歌词标题
+	const probeDecodedDur = await getAudioBlobDuration(audioBlob);
+	console.log(
+		`[AI Lyric][probe] SENDING to backend | decodedDur=${probeDecodedDur != null ? probeDecodedDur.toFixed(2) + 's' : '(decode-fail)'} | effSrc=${effectiveAudio?.src ?? '(null)'} effLocalPath=${effectiveLocalPath ?? '(null)'} | title="${songTitleProbe()}"`
+	);
+
 	// 5. 请求后端，同时获取标准 LRC 和逐字 LRC（带重试）
 	//    本地文件用其扩展名作为音频文件名，便于后端识别格式
 	const extMatch = effectiveLocalPath ? effectiveLocalPath.match(/\.(\w+)$/) : null;
@@ -829,7 +1086,7 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 		} catch (e) {
 			console.warn(`[AI Lyric] 请求后端失败 (第 ${attempt + 1} 次)`, e);
 			if (attempt < 1) {
-				await sleepUnthrottled(2000);
+				await sleep(2000);
 			}
 		}
 	}
