@@ -4,6 +4,8 @@
 import { parseLyric } from './liblyric/index.ts'
 import { cyrb53, getSetting } from './utils.js'
 import { applyAILyric, getCurrentAudio, isMetadataLine } from './ai-lyric-provider.js'
+// 窗口最小化时主线程 setTimeout 会被 Chromium 节流，用 Worker 定时器保证后台切歌时歌词流水线照常推进
+import { setTimeoutUnthrottled } from './wake-timer.js'
 
 const preProcessLyrics = (lyrics) => {
 	if (!lyrics) return null;
@@ -150,7 +152,7 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 			// 忽略，expectedSrc 保持 null（此时仅靠 songID 校验）
 		}
 
-		setTimeout(async () => {
+		setTimeoutUnthrottled(async () => {
 			let processedLyrics = await processLyrics(preprocessedLyrics);
 
 			// AI 逐字歌词处理：从 LibFrontendPlay 获取音频，连同歌词文本发送到本地后端，
@@ -208,9 +210,17 @@ window.onProcessLyrics = (_rawLyrics, songID) => {
 				lyrics.contributors.lyricSource = rawLyrics.source;
 			}
 			lyrics.hash = `${betterncm.ncm.getPlaying().id}-${cyrb53(processedLyrics.map((x) => x.originalLyric).join('\\'))}`;
-			window.currentLyrics = lyrics;
-			document.dispatchEvent(new CustomEvent('lyrics-updated', {detail: window.currentLyrics}));
-		}, 0);
+		window.currentLyrics = lyrics;
+		document.dispatchEvent(new CustomEvent('lyrics-updated', {detail: window.currentLyrics}));
+	}, 0);
 	}
 	return _onProcessLyrics(_rawLyrics, songID);
 }
+
+// 最小化期间其他插件（如 LyricBar）可能因自身被节流/尚未初始化而错过 lyrics-updated
+// 事件（该事件只派发一次）。窗口回到前台时重发一次当前歌词，保证所有插件都能拿到。
+document.addEventListener('visibilitychange', () => {
+	if (document.visibilityState === 'visible' && window.currentLyrics) {
+		document.dispatchEvent(new CustomEvent('lyrics-updated', {detail: window.currentLyrics}));
+	}
+});

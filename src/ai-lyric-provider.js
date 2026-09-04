@@ -9,6 +9,9 @@
 //   enhanced_lrc 为 ESLRC 逐字格式：行首 [mm:ss.xx] 为行起始，每个词后跟 [mm:ss.xx] 为词结束时间
 
 import { getSetting, cyrb53 } from './utils.js';
+// 网易云窗口最小化时 Chromium 会节流主线程 setTimeout 链，
+// 导致 AI 流水线（轮询元数据/重试/探测端口）停摆。改用 Worker 定时器不受节流影响。
+import { setTimeoutUnthrottled, clearTimeoutUnthrottled, sleepUnthrottled } from './wake-timer.js';
 
 const AI_BACKEND_START_PORT = 8000;
 const AI_BACKEND_MAX_TRIES = 10;
@@ -234,7 +237,9 @@ const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs
 
 	return new Promise((resolve) => {
 		let resolved = false;
-		const timeout = setTimeout(() => {
+		// 用 Worker 定时器：窗口最小化时主线程 setTimeout 会被节流到 1s 甚至 1min 一次，
+		// 整个等待逻辑会停摆；Worker 定时器不受页面可见性影响。
+		const timeout = setTimeoutUnthrottled(() => {
 			if (resolved) return;
 			resolved = true;
 			cleanupAll();
@@ -284,15 +289,15 @@ const waitForAudioMetadata = async (audio, expectedDurationSec = null, timeoutMs
 			} catch (e) {
 				// 忽略轮询中的异常
 			}
-			if (!resolved) {
-				pollTimer = setTimeout(poll, 500);
-			}
-		};
-		pollTimer = setTimeout(poll, 500);
+		if (!resolved) {
+			pollTimer = setTimeoutUnthrottled(poll, 500);
+		}
+	};
+	pollTimer = setTimeoutUnthrottled(poll, 500);
 
-		const cleanupAll = () => {
-			clearTimeout(timeout);
-			clearTimeout(pollTimer);
+	const cleanupAll = () => {
+		clearTimeoutUnthrottled(timeout);
+		clearTimeoutUnthrottled(pollTimer);
 			// 移除所有已添加的事件监听
 			seenAudios.forEach((el) => {
 				el.removeEventListener('loadedmetadata', onLoaded);
@@ -343,11 +348,12 @@ const findActiveBackendPort = async (startPort = AI_BACKEND_START_PORT, maxTries
 	for (let port = startPort; port < startPort + maxTries; port++) {
 		try {
 			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 300);
+			// 探测超时同样用 Worker 定时器，避免最小化时中止信号延迟、拖慢端口探测
+			const timeoutId = setTimeoutUnthrottled(() => controller.abort(), 300);
 			const response = await fetch(`http://127.0.0.1:${port}/api/ping`, {
 				signal: controller.signal,
 			});
-			clearTimeout(timeoutId);
+			clearTimeoutUnthrottled(timeoutId);
 			if (response.ok) {
 				const data = await response.json();
 				if (data.app === 'lrc-maker-ai') {
@@ -788,7 +794,7 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 			} catch (e) {
 				console.warn(`[AI Lyric] 获取音频失败 (第 ${attempt + 1} 次)`, e);
 				if (attempt < 2) {
-					await new Promise((r) => setTimeout(r, 1500));
+					await sleepUnthrottled(1500);
 					await waitForAudioMetadata(freshAudio, expectedDurationSec, 5000);
 				}
 			}
@@ -823,7 +829,7 @@ async function doApplyAILyric(lyrics, expectedSongId, expectedSrc, aiCacheKey) {
 		} catch (e) {
 			console.warn(`[AI Lyric] 请求后端失败 (第 ${attempt + 1} 次)`, e);
 			if (attempt < 1) {
-				await new Promise((r) => setTimeout(r, 2000));
+				await sleepUnthrottled(2000);
 			}
 		}
 	}
